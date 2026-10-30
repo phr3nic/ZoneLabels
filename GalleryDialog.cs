@@ -34,7 +34,7 @@ internal sealed class GalleryDialog : Form
             BackColor = Theme.BgDeep,
             ForeColor = Theme.Text,
             BorderStyle = BorderStyle.FixedSingle,
-            Font = new Font("Segoe UI", 9.5f),
+            Font = new Font("Segoe UI", 9f),
             IntegralHeight = false,
             DrawMode = DrawMode.OwnerDrawFixed,
             ItemHeight = 42,
@@ -55,40 +55,51 @@ internal sealed class GalleryDialog : Form
         var open = new RoundedButton
         {
             Text = "Open capture",
-            AutoSize = true,
+            AutoSize = false,
             BackColor = Theme.Panel,
             ForeColor = Theme.Text,
-            Padding = new Padding(10, 4, 10, 4),
+            Width = TextRenderer.MeasureText("Open capture", SystemFonts.MessageBoxFont).Width + 32,
+            Height = 32,
+            Padding = new Padding(12, 0, 12, 0),
+            Margin = new Padding(0, 0, 8, 0),
             Accent = true,
         };
         var cancel = new RoundedButton
         {
             Text = "Cancel",
-            AutoSize = true,
+            AutoSize = false,
             DialogResult = DialogResult.Cancel,
             BackColor = Theme.Panel,
             ForeColor = Theme.Text,
-            Padding = new Padding(10, 4, 10, 4),
+            Width = TextRenderer.MeasureText("Cancel", SystemFonts.MessageBoxFont).Width + 32,
+            Height = 32,
+            Padding = new Padding(12, 0, 12, 0),
+            Margin = new Padding(0, 0, 8, 0),
             Quiet = true,
         };
         var delete = new RoundedButton
         {
             Text = "Delete capture",
-            AutoSize = true,
+            AutoSize = false,
             BackColor = Theme.Panel,
             ForeColor = Theme.Warn,
-            Padding = new Padding(10, 4, 10, 4),
+            Width = TextRenderer.MeasureText("Delete capture", SystemFonts.MessageBoxFont).Width + 32,
+            Height = 32,
+            Padding = new Padding(12, 0, 12, 0),
+            Margin = new Padding(0, 0, 8, 0),
             Quiet = true,
             Enabled = _files.Count > 0,
         };
         var done = new RoundedButton
         {
             Text = "Mark done",
-            AutoSize = true,
+            AutoSize = false,
             BackColor = Theme.Panel,
             ForeColor = Theme.Success,
-            Padding = new Padding(10, 4, 10, 4),
-            Accent = true,
+            Width = TextRenderer.MeasureText("Mark done", SystemFonts.MessageBoxFont).Width + 32,
+            Height = 32,
+            Padding = new Padding(12, 0, 12, 0),
+            Margin = Padding.Empty,
             Enabled = _files.Count > 0,
         };
 
@@ -119,7 +130,7 @@ internal sealed class GalleryDialog : Form
         {
             Dock = DockStyle.Fill,
             ForeColor = Theme.Muted,
-            Font = new Font("Segoe UI Semibold", 9f, FontStyle.Bold),
+            Font = new Font("Segoe UI Semibold", 8.25f, FontStyle.Bold),
             TextAlign = ContentAlignment.MiddleLeft,
         };
         UpdateCaptureList();
@@ -128,18 +139,29 @@ internal sealed class GalleryDialog : Form
             Dock = DockStyle.Fill,
             SurfaceColor = Theme.BgDeep,
             EdgeColor = Theme.BorderSoft,
-            CornerRadius = 9,
             Padding = new Padding(4),
         };
         listSurface.Controls.Add(_captures);
         listSurface.Controls.Add(_emptyMessage);
         layout.Controls.Add(_heading, 0, 0);
         layout.Controls.Add(listSurface, 0, 1);
-        Controls.Add(layout);
-        Controls.Add(footer);
-        Controls.Add(Theme.CreateDialogTitleBar(this, Text));
+        var dialogSurface = new GlassPanel
+        {
+            Dock = DockStyle.Fill,
+            SurfaceColor = Theme.Panel,
+            EdgeColor = Theme.Border,
+            Padding = new Padding(1),
+            Margin = Padding.Empty,
+        };
+        dialogSurface.Controls.Add(layout);
+        dialogSurface.Controls.Add(footer);
+        dialogSurface.Controls.Add(Theme.CreateDialogTitleBar(this, Text));
+        Controls.Add(dialogSurface);
         AcceptButton = open;
         CancelButton = cancel;
+        var toolTips = new ToolTip();
+        ApplyButtonTooltips(this, toolTips);
+        Disposed += (_, _) => toolTips.Dispose();
 
         open.Click += (_, _) =>
         {
@@ -174,8 +196,23 @@ internal sealed class GalleryDialog : Form
     {
         int doneCount = _files.Count(file => CaptureFileOperations.IsCompleted(file, _doneDirectory));
         int todoCount = _files.Count - doneCount;
-        _heading.Text = $"CAPTURE LIBRARY     ·     {todoCount} TODO  /  {doneCount} DONE";
+        _heading.Text = $"Capture library  ·  {todoCount} todo / {doneCount} done";
         _emptyMessage.Visible = _files.Count == 0;
+    }
+
+    private static void ApplyButtonTooltips(Control parent, ToolTip toolTips)
+    {
+        foreach (Control child in parent.Controls)
+        {
+            if (child is Button button)
+            {
+                string text = string.IsNullOrWhiteSpace(button.AccessibleName)
+                    ? button.Text
+                    : button.AccessibleName;
+                toolTips.SetToolTip(button, string.IsNullOrWhiteSpace(text) ? "Button" : text);
+            }
+            ApplyButtonTooltips(child, toolTips);
+        }
     }
 
     private List<string> GetCaptureFiles() =>
@@ -287,7 +324,7 @@ internal sealed class GalleryDialog : Form
 
         bool selected = (e.State & DrawItemState.Selected) != 0;
         var bounds = e.Bounds;
-        Color background = selected ? Theme.AccentSoft : Theme.BgDeep;
+        Color background = selected ? Theme.PanelHi : Theme.BgDeep;
         using (var fill = new SolidBrush(background))
             e.Graphics.FillRectangle(fill, bounds);
 
@@ -300,8 +337,8 @@ internal sealed class GalleryDialog : Form
                 ? "OLDER GALLERY"
                 : "TODO";
         string details = $"{state}   ·   {created:g}";
-        using var titleFont = new Font("Segoe UI Semibold", 9.5f, FontStyle.Bold);
-        using var detailFont = new Font("Segoe UI", 8f);
+        using var titleFont = new Font("Segoe UI", 9f);
+        using var detailFont = new Font("Segoe UI", 8.25f);
         TextRenderer.DrawText(e.Graphics, filename, titleFont,
             new Rectangle(bounds.X + 12, bounds.Y + 4, bounds.Width - 24, 18),
             selected ? Color.White : Theme.Text, TextFormatFlags.EndEllipsis);
@@ -310,7 +347,7 @@ internal sealed class GalleryDialog : Form
             Theme.Muted, TextFormatFlags.EndEllipsis);
         if (selected)
         {
-            using var marker = new SolidBrush(Theme.Accent);
+            using var marker = new SolidBrush(Theme.Muted);
             e.Graphics.FillRectangle(marker, bounds.X, bounds.Y + 5, 3, bounds.Height - 10);
         }
         e.DrawFocusRectangle();

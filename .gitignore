@@ -1,8 +1,10 @@
 bin/
 obj/
+publish/
 portable*/
 dataset/
 config.json
+*.exe
 *.user
 *.suo
 .vs/

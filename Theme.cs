@@ -14,16 +14,15 @@ internal static class Theme
     [DllImport("user32.dll")]
     private static extern IntPtr SendMessage(IntPtr hwnd, int message, IntPtr wParam, IntPtr lParam);
 
-    public static readonly Color Bg = Color.FromArgb(0x0B, 0x0E, 0x14);
-    public static readonly Color BgDeep = Color.FromArgb(0x07, 0x09, 0x0E);
-    public static readonly Color Panel = Color.FromArgb(0x12, 0x17, 0x23);
-    public static readonly Color PanelHi = Color.FromArgb(0x1C, 0x23, 0x34);
-    public static readonly Color PanelTop = Color.FromArgb(0x19, 0x20, 0x2E);
-    public static readonly Color Border = Color.FromArgb(0x29, 0x33, 0x4A);
-    public static readonly Color BorderSoft = Color.FromArgb(0x1D, 0x26, 0x39);
-    public static readonly Color AccentSoft = Color.FromArgb(0x21, 0x22, 0x48);
-    public static readonly Color Text = Color.FromArgb(0xE6, 0xE9, 0xF2);
-    public static readonly Color Muted = Color.FromArgb(0x8A, 0x93, 0xA8);
+    public static readonly Color Bg = Color.FromArgb(0x0B, 0x0D, 0x12);
+    public static readonly Color BgDeep = Color.FromArgb(0x0B, 0x0D, 0x12);
+    public static readonly Color Panel = Color.FromArgb(0x12, 0x15, 0x1C);
+    public static readonly Color PanelHi = Color.FromArgb(0x1A, 0x1F, 0x2A);
+    public static readonly Color PanelTop = Color.FromArgb(0x12, 0x15, 0x1C);
+    public static readonly Color Border = Color.FromArgb(0x24, 0x2A, 0x3A);
+    public static readonly Color BorderSoft = Color.FromArgb(0x24, 0x2A, 0x3A);
+    public static readonly Color Text = Color.FromArgb(0xE6, 0xE9, 0xF0);
+    public static readonly Color Muted = Color.FromArgb(0x8A, 0x93, 0xA6);
     public static readonly Color Accent = Color.FromArgb(0x6C, 0x6C, 0xF0);
     public static readonly Color Success = Color.FromArgb(0x46, 0xD6, 0x9A);
     public static readonly Color Warn = Color.FromArgb(0xF0, 0x8C, 0x6C);
@@ -54,11 +53,14 @@ internal static class Theme
             BackColor = Bg,
             ForeColor = Text,
             Font = new Font("Segoe UI", 12f),
-            TabStop = false,
+            Cursor = Cursors.Hand,
+            TabStop = true,
             UseVisualStyleBackColor = false,
+            AccessibleName = "Close dialog",
         };
         close.FlatAppearance.BorderSize = 0;
-        close.FlatAppearance.MouseOverBackColor = Warn;
+        close.FlatAppearance.MouseOverBackColor = PanelHi;
+        close.FlatAppearance.MouseDownBackColor = Border;
         close.Click += (_, _) => form.Close();
         titleBar.Controls.Add(caption);
         titleBar.Controls.Add(close);

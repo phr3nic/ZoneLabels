@@ -42,12 +42,17 @@ public sealed class MainForm : Form
     private const int HtBottomRight = 17;
     private const int ResizeGrip = 8;
     private const uint ModNoRepeat = 0x4000;
+    private const uint ModAlt = 0x0001;
+    private const uint ModControl = 0x0002;
+    private const uint ModShift = 0x0004;
+    private const uint ModWindows = 0x0008;
     private const uint SrcCopy = 0x00CC0020;
     private const uint CaptureBlt = 0x40000000;
     private const int CaptureHotkeyId = 1;
     private const int DiscardHotkeyId = 2;
     private const int ZoneHotkeyBase = 10;
     private const int PinConfirmationMs = 550;
+    private const int CropSize = 96;
 
     private readonly string _configPath = Path.Combine(AppContext.BaseDirectory, "config.json");
     private readonly string _imageDirectory = Path.Combine(Log.Directory, "data");
@@ -56,23 +61,32 @@ public sealed class MainForm : Form
     private readonly string _legacyGalleryDirectory = Path.Combine(Log.Directory, "gallery");
     private readonly string _csvPath = Path.Combine(Log.Directory, "labels.csv");
     private readonly Dictionary<string, int> _counts = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, Label> _countLabels = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, ZoneCountRow> _countLabels = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, Label> _countStripLabels = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, RoundedButton> _zoneButtons = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<int> _registeredHotkeys = new();
     private readonly List<ScreenPin> _pins = new();
+    private readonly List<ScreenPin> _placedPins = new();
     private readonly ScreenPreview _preview;
+    private readonly CropPreview _cropPreview;
+    private CropPreviewSurface? _cropPreviewSurface;
     private readonly FlowLayoutPanel _zoneButtonsPanel;
     private readonly FlowLayoutPanel _countList;
+    private readonly FlowLayoutPanel _datasetCountStrip;
     private readonly Label _statusLabel;
-    private readonly Label _shortcutHint;
+    private readonly Label _statusIcon;
+    private readonly Label _hotkeyIndicator;
     private readonly RoundedButton _captureButton;
+    private readonly RoundedButton _saveButton;
     private readonly RoundedButton _discardButton;
     private readonly RoundedButton _doneButton;
     private readonly RoundedButton _fullScreenButton;
     private readonly ToolTip _windowToolTip;
-    private readonly CheckBox _alwaysOnTopCheck;
-    private readonly CheckBox _hideWhileCapturingCheck;
+    private readonly ToggleRow _alwaysOnTopCheck;
+    private readonly ToggleRow _hideWhileCapturingCheck;
     private readonly System.Windows.Forms.Timer _pinFlashTimer;
+    private readonly System.Windows.Forms.Timer _discardClickTimer;
+    private readonly System.Windows.Forms.Timer _boundsSaveTimer;
     private AppConfig _config;
     private string? _currentGalleryPath;
     private GalleryCapture _currentGallery = new();
@@ -91,7 +105,9 @@ public sealed class MainForm : Form
         if (!_timerResolutionAcquired)
             Log.Error($"timeBeginPeriod(1) failed with result {timerResult}.");
 
-        EnsureFolders();
+        Directory.CreateDirectory(Log.Directory);
+        Directory.CreateDirectory(_imageDirectory);
+        Directory.CreateDirectory(_todoDirectory);
         try
         {
             _config = AppConfig.Load(_configPath);
@@ -103,17 +119,32 @@ public sealed class MainForm : Form
             _configWarning = "Could not load config.json; defaults are active. See dataset/capture.log.";
         }
 
-        foreach (var zone in _config.Zones)
-            _counts[zone.Name] = 0;
+        if (!File.Exists(_configPath))
+        {
+            try
+            {
+                WriteConfig(_config);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                Log.Error("creating config.json with defaults failed", ex);
+                _configWarning = "Could not create config.json. See dataset/capture.log.";
+            }
+        }
+
+        PurgeDoneOnStartup();
+        EnsureFolders();
+        RecountLabels();
 
         Text = "Zone Labeller";
         FormBorderStyle = FormBorderStyle.None;
         BackColor = Theme.Bg;
         ForeColor = Theme.Text;
-        Font = new Font("Segoe UI", 9.5f);
+        Font = new Font("Segoe UI", 9f);
         ClientSize = new Size(1380, 900);
-        MinimumSize = new Size(1040, 700);
-        StartPosition = FormStartPosition.CenterScreen;
+        MinimumSize = new Size(800, 600);
+        StartPosition = FormStartPosition.Manual;
+        RestoreWindowBounds();
         KeyPreview = true;
         DoubleBuffered = true;
 
@@ -125,6 +156,8 @@ public sealed class MainForm : Form
         };
         _preview.PinCreated += AddPin;
         _preview.PinDeleteRequested += DeletePin;
+        _preview.PreviewPinChanged += UpdateCropPreview;
+        _cropPreview = new CropPreview();
 
         _zoneButtonsPanel = new FlowLayoutPanel
         {
@@ -132,7 +165,7 @@ public sealed class MainForm : Form
             WrapContents = true,
             FlowDirection = FlowDirection.LeftToRight,
             Margin = new Padding(0),
-            Padding = new Padding(2, 7, 2, 0),
+            Padding = Padding.Empty,
             BackColor = Color.Transparent,
         };
         _countList = new FlowLayoutPanel
@@ -142,6 +175,18 @@ public sealed class MainForm : Form
             FlowDirection = FlowDirection.TopDown,
             WrapContents = false,
             Margin = new Padding(0),
+            Padding = Padding.Empty,
+            BackColor = Theme.Panel,
+        };
+        _countList.SizeChanged += (_, _) => UpdateCountRowWidths();
+        _datasetCountStrip = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            AutoScroll = true,
+            Margin = Padding.Empty,
+            Padding = new Padding(16, 8, 16, 8),
             BackColor = Color.Transparent,
         };
         _statusLabel = new Label
@@ -150,33 +195,67 @@ public sealed class MainForm : Form
             AutoEllipsis = true,
             TextAlign = ContentAlignment.MiddleLeft,
             ForeColor = Theme.Text,
-            Margin = new Padding(12, 0, 0, 0),
+            Font = new Font("Segoe UI", 9f),
+            Margin = new Padding(8, 0, 0, 0),
         };
-        _shortcutHint = new Label
+        _statusIcon = new Label
         {
-            AutoSize = true,
-            ForeColor = Theme.Muted,
-            Font = new Font("Segoe UI Semibold", 8.5f, FontStyle.Bold),
-            Anchor = AnchorStyles.Left,
-            Margin = new Padding(8, 8, 12, 0),
+            Text = "●",
+            Anchor = AnchorStyles.None,
+            Width = 16,
+            Height = 16,
+            ForeColor = Theme.Success,
+            Font = new Font("Segoe UI", 9f),
+            TextAlign = ContentAlignment.MiddleCenter,
+            Margin = new Padding(0),
         };
-        _captureButton = new RoundedButton { Text = string.Empty, Width = 132, Height = 36, Accent = true };
-        _discardButton = new RoundedButton { Text = string.Empty, Width = 118, Height = 36 };
+        _hotkeyIndicator = new Label
+        {
+            Text = "●",
+            Width = 16,
+            Height = 16,
+            Anchor = AnchorStyles.None,
+            ForeColor = Theme.Muted,
+            Font = new Font("Segoe UI", 8f),
+            TextAlign = ContentAlignment.MiddleCenter,
+            AccessibleName = "Hotkeys suppressed",
+            Margin = new Padding(0),
+        };
+        _captureButton = new RoundedButton { Text = string.Empty, Width = 160, Height = 32, Accent = true };
+        _saveButton = new RoundedButton { Text = "Save", Width = 64, Height = 32, Quiet = false };
+        _discardButton = new RoundedButton { Text = string.Empty, Width = 88, Height = 32 };
         _doneButton = new RoundedButton
         {
             Text = "✓  Done",
-            Width = 92,
-            Height = 36,
+            Width = 72,
+            Height = 32,
             ForeColor = Theme.Success,
             Enabled = false,
         };
-        _fullScreenButton = new RoundedButton { Text = "⛶", Width = 34, Height = 32, Quiet = true };
+        _fullScreenButton = new RoundedButton { Text = "⛶", Width = 32, Height = 32, Quiet = true };
         _windowToolTip = new ToolTip { BackColor = Theme.Panel, ForeColor = Theme.Text, InitialDelay = 450 };
         _windowToolTip.SetToolTip(_fullScreenButton, "Enter full screen (F11)");
         _windowToolTip.SetToolTip(_doneButton, "Save labeled crops and move this capture to dataset\\done");
-        _alwaysOnTopCheck = new CheckBox { Text = "Always on top", AutoSize = true, ForeColor = Theme.Text };
-        _hideWhileCapturingCheck = new CheckBox { Text = "Hide while capturing", AutoSize = true, ForeColor = Theme.Text };
+        _windowToolTip.SetToolTip(_saveButton, "Save this capture's current pins without exporting crops");
+        _windowToolTip.SetToolTip(_discardButton, "Click to confirm discard; double-click to discard immediately");
+        _alwaysOnTopCheck = new ToggleRow("Always on top");
+        _hideWhileCapturingCheck = new ToggleRow("Hide while capturing");
         _pinFlashTimer = new System.Windows.Forms.Timer { Interval = PinConfirmationMs };
+        _discardClickTimer = new System.Windows.Forms.Timer
+        {
+            Interval = SystemInformation.DoubleClickTime + 50,
+        };
+        _discardClickTimer.Tick += (_, _) =>
+        {
+            _discardClickTimer.Stop();
+            DiscardPins();
+        };
+        _boundsSaveTimer = new System.Windows.Forms.Timer { Interval = 500 };
+        _boundsSaveTimer.Tick += (_, _) =>
+        {
+            _boundsSaveTimer.Stop();
+            SaveWindowBounds();
+        };
         _pinFlashTimer.Tick += (_, _) =>
         {
             _pinFlashTimer.Stop();
@@ -184,17 +263,33 @@ public sealed class MainForm : Form
             _preview.Invalidate();
         };
         BuildUi();
+        AttachHotkeyFocusEvents(this);
+        ApplyMainButtonTooltips(this);
         RefreshConfigUi();
         RefreshZoneUi();
         TopMost = _config.AlwaysOnTop;
         _alwaysOnTopCheck.Checked = _config.AlwaysOnTop;
         _hideWhileCapturingCheck.Checked = _config.HideWhileCapturing;
-        SetStatus(_configWarning ?? $"Ready. Press {FormatConfiguredKey(_config.CaptureKey)} over the target.");
+        SetStatus(_configWarning ?? GetCaptureReadyMessage());
         Resize += (_, _) => UpdateWindowRegion();
         Shown += (_, _) => UpdateWindowRegion();
+        Activated += (_, _) => UpdateHotkeyIndicator();
+        Deactivate += (_, _) => UpdateHotkeyIndicator();
+        Move += (_, _) => ScheduleWindowBoundsSave();
+        ResizeEnd += (_, _) => ScheduleWindowBoundsSave();
         KeyDown += OnFormKeyDown;
         _captureButton.Click += async (_, _) => await CaptureRequested();
-        _discardButton.Click += (_, _) => DiscardPins();
+        _saveButton.Click += (_, _) => SaveCurrentProgress();
+        _discardButton.Click += (_, _) =>
+        {
+            _discardClickTimer.Stop();
+            _discardClickTimer.Start();
+        };
+        _discardButton.DoubleClick += (_, _) =>
+        {
+            _discardClickTimer.Stop();
+            DiscardPins(bypassWarning: true);
+        };
         _doneButton.Click += (_, _) => CompleteCurrentCapture();
         _fullScreenButton.Click += (_, _) => ToggleFullScreen();
         _alwaysOnTopCheck.CheckedChanged += (_, _) =>
@@ -216,22 +311,60 @@ public sealed class MainForm : Form
     {
         var root = new TableLayoutPanel
         {
-            Dock = DockStyle.Fill,
+            Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
             BackColor = Theme.Bg,
-            Padding = new Padding(18, 12, 18, 12),
+            Padding = new Padding(16),
             ColumnCount = 1,
-            RowCount = 4,
+            RowCount = 3,
+            MinimumSize = new Size(1160, 700),
+            Margin = Padding.Empty,
         };
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 64));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 56));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 88));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 98));
 
         root.Controls.Add(BuildTitleBar(), 0, 0);
         root.Controls.Add(BuildWorkspace(), 0, 1);
-        root.Controls.Add(BuildZoneBar(), 0, 2);
-        root.Controls.Add(BuildFooter(), 0, 3);
-        Controls.Add(root);
+        root.Controls.Add(BuildBottomBand(), 0, 2);
+        var viewport = new Panel
+        {
+            Dock = DockStyle.Fill,
+            AutoScroll = true,
+            BackColor = Theme.Bg,
+            Margin = Padding.Empty,
+        };
+        viewport.Controls.Add(root);
+        viewport.SizeChanged += (_, _) =>
+        {
+            root.Width = Math.Max(root.MinimumSize.Width, viewport.ClientSize.Width);
+            root.Height = Math.Max(root.MinimumSize.Height, viewport.ClientSize.Height);
+        };
+        Controls.Add(viewport);
+        root.Width = Math.Max(root.MinimumSize.Width, viewport.ClientSize.Width);
+        root.Height = Math.Max(root.MinimumSize.Height, viewport.ClientSize.Height);
+    }
+
+    private Control BuildBottomBand()
+    {
+        var band = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 5,
+            Margin = Padding.Empty,
+            BackColor = Theme.Bg,
+        };
+        band.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
+        band.RowStyles.Add(new RowStyle(SizeType.Absolute, 1));
+        band.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
+        band.RowStyles.Add(new RowStyle(SizeType.Absolute, 1));
+        band.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
+        band.Controls.Add(BuildZoneBar(), 0, 0);
+        band.Controls.Add(CreateDivider(), 0, 1);
+        band.Controls.Add(BuildFooter(), 0, 2);
+        band.Controls.Add(CreateDivider(), 0, 3);
+        band.Controls.Add(BuildCountStrip(), 0, 4);
+        return band;
     }
 
     private Control BuildTitleBar()
@@ -242,74 +375,85 @@ public sealed class MainForm : Form
             BackColor = Theme.Bg,
             ColumnCount = 2,
             RowCount = 1,
-            Margin = new Padding(2, 0, 2, 4),
-        };
-        header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 48));
-        header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 52));
-        var brand = new TableLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            BackColor = Theme.Bg,
-            ColumnCount = 1,
-            RowCount = 2,
             Margin = new Padding(0),
         };
-        brand.RowStyles.Add(new RowStyle(SizeType.Percent, 62));
-        brand.RowStyles.Add(new RowStyle(SizeType.Percent, 38));
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         var title = new Label
         {
-            Text = "ZONE LABELLER",
+            Text = "Zone Labeller",
             AutoSize = true,
-            ForeColor = Theme.Accent,
-            Font = new Font("Segoe UI Semibold", 15f, FontStyle.Bold),
-            TextAlign = ContentAlignment.BottomLeft,
-            Dock = DockStyle.Fill,
-            Margin = new Padding(4, 0, 0, 0),
+            ForeColor = Theme.Text,
+            Font = new Font("Segoe UI Semibold", 10f, FontStyle.Bold),
+            TextAlign = ContentAlignment.MiddleLeft,
+            Anchor = AnchorStyles.Left,
+            Padding = Padding.Empty,
+            Margin = Padding.Empty,
         };
-        var glowText = new Label
-        {
-            Text = "FULL-FRAME DATA COLLECTION  ·  BORDERLESS CAPTURE",
-            AutoSize = true,
-            ForeColor = Theme.Muted,
-            Font = new Font("Consolas", 8f),
-            TextAlign = ContentAlignment.TopLeft,
-            Dock = DockStyle.Fill,
-            Margin = new Padding(5, 1, 0, 0),
-        };
-        brand.Controls.Add(title, 0, 0);
-        brand.Controls.Add(glowText, 0, 1);
-        var controls = new FlowLayoutPanel
+        title.Dock = DockStyle.Left;
+        header.Controls.Add(title, 0, 0);
+
+        var rightControls = new FlowLayoutPanel
         {
             Dock = DockStyle.Fill,
-            FlowDirection = FlowDirection.RightToLeft,
+            FlowDirection = FlowDirection.LeftToRight,
             WrapContents = false,
-            Padding = new Padding(0, 10, 0, 0),
+            Padding = new Padding(0),
             BackColor = Theme.Bg,
             Margin = new Padding(0),
+            AutoSize = true,
         };
-        var close = new RoundedButton { Text = "×", Width = 34, Height = 32, Quiet = true };
-        var minimize = new RoundedButton { Text = "−", Width = 34, Height = 32, Quiet = true };
+        var actions = new FlowLayoutPanel
+        {
+            AutoSize = true,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Margin = new Padding(0, 0, 16, 0),
+            Padding = new Padding(0, 12, 0, 12),
+            BackColor = Theme.Bg,
+        };
+        foreach (RoundedButton button in new[] { _captureButton, _discardButton, _saveButton, _doneButton })
+        {
+            button.Margin = new Padding(0, 0, 8, 0);
+            actions.Controls.Add(button);
+        }
+
+        var divider = CreateDivider();
+        divider.Width = 1;
+        divider.Dock = DockStyle.Left;
+        divider.Margin = new Padding(0, 12, 16, 12);
+
+        var windowControls = new FlowLayoutPanel
+        {
+            AutoSize = true,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Margin = Padding.Empty,
+            Padding = new Padding(0, 12, 0, 12),
+            BackColor = Theme.Bg,
+        };
+        var close = new RoundedButton { Text = "×", Width = 32, Height = 32, Quiet = true };
+        var minimize = new RoundedButton { Text = "−", Width = 32, Height = 32, Quiet = true };
+        _fullScreenButton.Width = 32;
+        _fullScreenButton.Height = 32;
+        foreach (RoundedButton button in new[] { _fullScreenButton, minimize, close })
+        {
+            button.Margin = new Padding(0, 0, 8, 0);
+            windowControls.Controls.Add(button);
+        }
+        windowControls.Controls[windowControls.Controls.Count - 1].Margin = Padding.Empty;
+
         _windowToolTip.SetToolTip(close, "Close Zone Labeller");
         _windowToolTip.SetToolTip(minimize, "Minimize");
         close.Click += (_, _) => Close();
         minimize.Click += (_, _) => WindowState = FormWindowState.Minimized;
-        _captureButton.Margin = new Padding(6, 0, 0, 0);
-        _discardButton.Margin = new Padding(6, 0, 0, 0);
-        _doneButton.Margin = new Padding(6, 0, 0, 0);
-        controls.Controls.Add(close);
-        controls.Controls.Add(minimize);
-        controls.Controls.Add(_fullScreenButton);
-        controls.Controls.Add(_doneButton);
-        controls.Controls.Add(_discardButton);
-        controls.Controls.Add(_captureButton);
-        controls.Controls.Add(_shortcutHint);
-        header.Controls.Add(brand, 0, 0);
-        header.Controls.Add(controls, 1, 0);
-        header.MouseDown += DragWindow;
-        brand.MouseDown += DragWindow;
+        rightControls.Controls.Add(actions);
+        rightControls.Controls.Add(divider);
+        rightControls.Controls.Add(windowControls);
+        header.Controls.Add(rightControls, 1, 0);
+
         title.MouseDown += DragWindow;
         title.DoubleClick += (_, _) => ToggleFullScreen();
-        glowText.MouseDown += DragWindow;
         return header;
     }
 
@@ -318,26 +462,79 @@ public sealed class MainForm : Form
         var workspace = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
-            ColumnCount = 2,
+            ColumnCount = 3,
             RowCount = 1,
-            Margin = new Padding(0, 4, 0, 8),
+            Margin = new Padding(0),
         };
         workspace.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        workspace.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 252));
+        workspace.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 1));
+        workspace.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 280));
 
         var previewFrame = new GlassPanel
         {
             Dock = DockStyle.Fill,
             SurfaceColor = Theme.BgDeep,
             EdgeColor = Theme.Border,
-            CornerRadius = 13,
             Padding = new Padding(1),
-            Margin = new Padding(0, 0, 14, 0),
+            Margin = new Padding(0),
         };
         _preview.BackColor = Theme.BgDeep;
         previewFrame.Controls.Add(_preview);
+
+        var cropSurface = _cropPreviewSurface = new CropPreviewSurface
+        {
+            Size = new Size(208, 232),
+            BackColor = Theme.Panel,
+            Padding = new Padding(8),
+            Anchor = AnchorStyles.Right | AnchorStyles.Bottom,
+            Margin = new Padding(0),
+            Visible = false,
+        };
+        var cropLayout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+            Margin = new Padding(0),
+            BackColor = Theme.Panel,
+        };
+        cropLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 24));
+        cropLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 192));
+        var cropCaption = new Label
+        {
+            Text = "Crop 96",
+            Dock = DockStyle.Fill,
+            ForeColor = Theme.Muted,
+            Font = new Font("Segoe UI Semibold", 8.25f, FontStyle.Bold),
+            TextAlign = ContentAlignment.MiddleLeft,
+            Margin = new Padding(0),
+        };
+        _cropPreview.Size = new Size(192, 192);
+        _cropPreview.Margin = new Padding(0);
+        cropLayout.Controls.Add(cropCaption, 0, 0);
+        cropLayout.Controls.Add(_cropPreview, 0, 1);
+        cropSurface.Controls.Add(cropLayout);
+        _windowToolTip.SetToolTip(cropSurface,
+            "Right-drag over the canvas to pan while zoomed. Scroll over the canvas to zoom.");
+        _windowToolTip.SetToolTip(_cropPreview,
+            "Right-drag over the canvas to pan while zoomed. Scroll over the canvas to zoom.");
+        cropSurface.Location = new Point(previewFrame.ClientSize.Width - cropSurface.Width - 16,
+            previewFrame.ClientSize.Height - cropSurface.Height - 16);
+        previewFrame.Controls.Add(cropSurface);
+        cropSurface.BringToFront();
+        previewFrame.SizeChanged += (_, _) =>
+            cropSurface.Location = new Point(previewFrame.ClientSize.Width - cropSurface.Width - 16,
+                previewFrame.ClientSize.Height - cropSurface.Height - 16);
+
+        var separator = new Panel
+        {
+            Dock = DockStyle.Fill,
+            BackColor = Theme.Border,
+            Margin = new Padding(0),
+        };
         workspace.Controls.Add(previewFrame, 0, 0);
-        workspace.Controls.Add(BuildSidebar(), 1, 0);
+        workspace.Controls.Add(separator, 1, 0);
+        workspace.Controls.Add(BuildSidebar(), 2, 0);
         return workspace;
     }
 
@@ -347,132 +544,211 @@ public sealed class MainForm : Form
         {
             Dock = DockStyle.Fill,
             SurfaceColor = Theme.Panel,
-            EdgeColor = Theme.BorderSoft,
-            CornerRadius = 13,
-            Padding = new Padding(15, 14, 15, 14),
+            EdgeColor = Theme.Border,
+            Padding = new Padding(16),
             Margin = new Padding(0),
         };
-        var sidebarLayout = new TableLayoutPanel
+        var layout = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
             BackColor = Color.Transparent,
             ColumnCount = 1,
-            RowCount = 4,
+            RowCount = 6,
             Margin = new Padding(0),
         };
-        sidebarLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
-        sidebarLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        sidebarLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        sidebarLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 24));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 72));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 72));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         var caption = new Label
         {
-            Text = "LABELLED ZONES",
+            Text = "Label counts",
             AutoSize = true,
-            ForeColor = Theme.Text,
-            Font = new Font("Segoe UI Semibold", 10.5f, FontStyle.Bold),
-            Margin = new Padding(1, 0, 0, 10),
+            ForeColor = Theme.Muted,
+            Font = new Font("Segoe UI Semibold", 8.25f, FontStyle.Bold),
+            TextAlign = ContentAlignment.MiddleLeft,
+            Margin = new Padding(0, 0, 0, 8),
         };
         var countsFrame = new GlassPanel
         {
-            Dock = DockStyle.Fill,
-            SurfaceColor = Theme.BgDeep,
-            EdgeColor = Theme.BorderSoft,
-            CornerRadius = 9,
-            Padding = new Padding(9, 8, 5, 8),
-            Margin = new Padding(0),
+            Dock = DockStyle.Top,
+            SurfaceColor = Theme.Panel,
+            EdgeColor = Theme.Border,
+            Padding = new Padding(1),
+            Margin = new Padding(0, 0, 0, 8),
         };
         countsFrame.Controls.Add(_countList);
-        var options = new FlowLayoutPanel
+        var utilityActions = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Padding = Padding.Empty,
+            Margin = Padding.Empty,
+            BackColor = Color.Transparent,
+        };
+        var openFolder = new RoundedButton
+        {
+            Width = 32,
+            Height = 32,
+            Quiet = true,
+            Icon = RoundedButtonIcon.Folder,
+            AccessibleName = "Open dataset folder",
+        };
+        var reset = new RoundedButton
+        {
+            Width = 32,
+            Height = 32,
+            Quiet = true,
+            Icon = RoundedButtonIcon.Refresh,
+            AccessibleName = "Refresh counts",
+        };
+        openFolder.AccessibleName = "Open dataset folder";
+        reset.AccessibleName = "Refresh counts";
+        _windowToolTip.SetToolTip(openFolder, "Open dataset folder");
+        _windowToolTip.SetToolTip(reset, "Refresh counts");
+        openFolder.Margin = new Padding(0, 0, 8, 0);
+        reset.Margin = Padding.Empty;
+        openFolder.Click += (_, _) => OpenDatasetFolder();
+        reset.Click += (_, _) => RefreshCounts();
+        utilityActions.Controls.Add(openFolder);
+        utilityActions.Controls.Add(reset);
+
+        var mainActions = new FlowLayoutPanel
         {
             Dock = DockStyle.Fill,
             FlowDirection = FlowDirection.TopDown,
             WrapContents = false,
-            AutoSize = true,
-            Padding = new Padding(0, 12, 0, 0),
+            Padding = Padding.Empty,
+            Margin = Padding.Empty,
             BackColor = Color.Transparent,
         };
-        var settings = new RoundedButton { Text = "⚙   Label settings", Width = 210, Height = 38 };
-        var gallery = new RoundedButton { Text = "▤   Capture library", Width = 210, Height = 38 };
-        var openFolder = new RoundedButton { Text = "↗   Open dataset folder", Width = 210, Height = 38 };
-        var reset = new RoundedButton { Text = "↺   Reset counts", Width = 210, Height = 38, Quiet = true };
+        var settings = new RoundedButton { Text = "Label settings", Width = 246, Height = 32 };
+        var gallery = new RoundedButton { Text = "Capture library", Width = 246, Height = 32 };
+        _windowToolTip.SetToolTip(settings, "Edit label zones, targets, retention, and shortcuts.");
+        _windowToolTip.SetToolTip(gallery, "Browse and reopen saved captures.");
+        settings.Margin = new Padding(0, 0, 0, 8);
+        gallery.Margin = Padding.Empty;
         settings.Click += (_, _) => EditSettings();
         gallery.Click += (_, _) => OpenGallery();
-        openFolder.Click += (_, _) => OpenDatasetFolder();
-        reset.Click += (_, _) => ResetCounts();
-        options.Controls.Add(settings);
-        options.Controls.Add(gallery);
-        options.Controls.Add(openFolder);
-        options.Controls.Add(reset);
-        var checkboxes = new FlowLayoutPanel
+        mainActions.Controls.Add(settings);
+        mainActions.Controls.Add(gallery);
+
+        var toggles = new FlowLayoutPanel
         {
             Dock = DockStyle.Fill,
             FlowDirection = FlowDirection.TopDown,
             WrapContents = false,
-            AutoSize = true,
-            Padding = new Padding(0, 13, 0, 0),
+            Padding = Padding.Empty,
+            Margin = Padding.Empty,
             BackColor = Color.Transparent,
         };
-        _alwaysOnTopCheck.BackColor = Color.Transparent;
-        _hideWhileCapturingCheck.BackColor = Color.Transparent;
-        checkboxes.Controls.Add(_alwaysOnTopCheck);
-        checkboxes.Controls.Add(_hideWhileCapturingCheck);
-        sidebarLayout.Controls.Add(caption, 0, 0);
-        sidebarLayout.Controls.Add(countsFrame, 0, 1);
-        sidebarLayout.Controls.Add(options, 0, 2);
-        sidebarLayout.Controls.Add(checkboxes, 0, 3);
-        sidebar.Controls.Add(sidebarLayout);
+        _alwaysOnTopCheck.Margin = new Padding(0, 0, 0, 8);
+        _hideWhileCapturingCheck.Margin = Padding.Empty;
+        _windowToolTip.SetToolTip(_alwaysOnTopCheck, "Keep Zone Labeller above other windows.");
+        _windowToolTip.SetToolTip(_hideWhileCapturingCheck, "Hide Zone Labeller while capturing the screen.");
+        toggles.Controls.Add(_alwaysOnTopCheck);
+        toggles.Controls.Add(_hideWhileCapturingCheck);
+
+        var sidebarFooter = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 1,
+            Margin = new Padding(0),
+        };
+        var repositoryLink = new LinkLabel
+        {
+            Text = "github.com/phr3nic/ZoneLabels",
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            LinkColor = Theme.Muted,
+            ActiveLinkColor = Theme.Text,
+            VisitedLinkColor = Theme.Muted,
+            Font = new Font("Segoe UI", 8.25f),
+            Margin = new Padding(0),
+            BackColor = Color.Transparent,
+            TabStop = true,
+            LinkBehavior = LinkBehavior.NeverUnderline,
+        };
+        repositoryLink.AccessibleName = "Open ZoneLabels GitHub repository";
+        _windowToolTip.SetToolTip(repositoryLink, "Open github.com/phr3nic/ZoneLabels");
+        repositoryLink.LinkClicked += (_, _) =>
+        {
+            try
+            {
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = "https://github.com/phr3nic/ZoneLabels",
+                    UseShellExecute = true,
+                });
+            }
+            catch (Exception ex)
+            {
+                Log.Error("opening repository link failed", ex);
+                SetStatus($"Could not open repository link. See {Log.FilePath}.", true);
+            }
+        };
+        sidebarFooter.Controls.Add(repositoryLink, 0, 0);
+
+        layout.Controls.Add(caption, 0, 0);
+        layout.Controls.Add(countsFrame, 0, 1);
+        layout.Controls.Add(utilityActions, 0, 2);
+        layout.Controls.Add(mainActions, 0, 3);
+        layout.Controls.Add(toggles, 0, 4);
+        layout.Controls.Add(sidebarFooter, 0, 5);
+        sidebar.Controls.Add(layout);
         return sidebar;
     }
 
     private Control BuildZoneBar()
     {
-        var surface = new GlassPanel
-        {
-            Dock = DockStyle.Fill,
-            SurfaceColor = Theme.Panel,
-            EdgeColor = Theme.BorderSoft,
-            CornerRadius = 11,
-            Padding = new Padding(11, 5, 11, 0),
-            Margin = new Padding(0, 2, 0, 0),
-        };
-        var container = new TableLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            ColumnCount = 1,
-            RowCount = 2,
-            BackColor = Color.Transparent,
-            Margin = new Padding(0),
-        };
-        container.RowStyles.Add(new RowStyle(SizeType.Absolute, 21));
-        container.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        var caption = new Label
-        {
-            Text = "ASSIGN ZONE TO LAST PIN",
-            AutoSize = true,
-            ForeColor = Theme.Muted,
-            Font = new Font("Segoe UI Semibold", 8.5f, FontStyle.Bold),
-            Margin = new Padding(2, 2, 0, 0),
-        };
-        container.Controls.Add(caption, 0, 0);
-        container.Controls.Add(_zoneButtonsPanel, 0, 1);
-        surface.Controls.Add(container);
-        return surface;
+        _zoneButtonsPanel.Dock = DockStyle.Fill;
+        _zoneButtonsPanel.WrapContents = false;
+        _zoneButtonsPanel.AutoScroll = true;
+        _zoneButtonsPanel.Padding = new Padding(16, 0, 16, 0);
+        _zoneButtonsPanel.Margin = new Padding(0);
+        return _zoneButtonsPanel;
     }
 
     private Control BuildFooter()
     {
-        var footer = new GlassPanel
+        var statusRow = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
-            SurfaceColor = Theme.Panel,
-            EdgeColor = Theme.BorderSoft,
-            CornerRadius = 9,
-            Padding = new Padding(4, 0, 8, 0),
-            Margin = new Padding(0, 3, 0, 0),
+            ColumnCount = 3,
+            Margin = new Padding(0),
+            Padding = new Padding(16, 0, 0, 0),
+            BackColor = Theme.Bg,
         };
-        footer.Controls.Add(_statusLabel);
-        return footer;
+        statusRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 16));
+        statusRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        statusRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 24));
+        statusRow.Controls.Add(_statusIcon, 0, 0);
+        statusRow.Controls.Add(_statusLabel, 1, 0);
+        statusRow.Controls.Add(_hotkeyIndicator, 2, 0);
+        return statusRow;
     }
+
+    private Control BuildCountStrip()
+    {
+        _datasetCountStrip.Dock = DockStyle.Fill;
+        _datasetCountStrip.FlowDirection = FlowDirection.LeftToRight;
+        _datasetCountStrip.WrapContents = false;
+        _datasetCountStrip.AutoScroll = true;
+        _datasetCountStrip.Margin = new Padding(0);
+        _datasetCountStrip.Padding = new Padding(16, 0, 16, 0);
+        return _datasetCountStrip;
+    }
+
+    private static Control CreateDivider() => new Panel
+    {
+        Dock = DockStyle.Fill,
+        BackColor = Theme.Border,
+        Margin = new Padding(0),
+    };
 
     private void RefreshConfigUi()
     {
@@ -480,9 +756,48 @@ public sealed class MainForm : Form
         string discard = FormatConfiguredKey(_config.DiscardKey);
         _captureButton.Text = $"Capture  [{capture}]";
         _discardButton.Text = $"Discard  [{discard}]";
-        _shortcutHint.Text = $"{capture} CAPTURE   {discard} DISCARD   F11 FULL SCREEN";
+        FitButtonToText(_captureButton);
+        FitButtonToText(_discardButton);
+        FitButtonToText(_saveButton);
+        FitButtonToText(_doneButton);
+        bool globalCapture = AppConfig.ParseHotkey(_config.CaptureKey).Modifiers.HasFlag(HotkeyModifiers.Alt);
+        _windowToolTip.SetToolTip(_captureButton, $"Capture ({capture}). "
+            + (globalCapture
+                ? "Works globally while the pointer is outside this window."
+                : "Works while the canvas has focus."));
+        _windowToolTip.SetToolTip(_discardButton,
+            $"Discard ({discard}). Click to confirm; double-click to bypass confirmation.");
+        _windowToolTip.SetToolTip(_saveButton, "Save current pin progress without exporting crops.");
+        _windowToolTip.SetToolTip(_doneButton, "Export labeled crops and move this capture to dataset\\done.");
         _preview.CaptureShortcut = capture;
+        _preview.MinimumPinSpacing = _config.MinPinSpacing;
+        _windowToolTip.SetToolTip(_preview,
+            $"Capture: {capture}. Right-drag to pan while zoomed; scroll to zoom; pin shortcuts work when this canvas has focus.");
+        UpdateHotkeyIndicator();
     }
+
+    private static void FitButtonToText(RoundedButton button) =>
+        button.Width = Math.Max(32, TextRenderer.MeasureText(button.Text, button.Font).Width + 24);
+
+    private void ApplyMainButtonTooltips(Control parent)
+    {
+        foreach (Control child in parent.Controls)
+        {
+            if (child is Button button && string.IsNullOrWhiteSpace(_windowToolTip.GetToolTip(button)))
+            {
+                string text = string.IsNullOrWhiteSpace(button.AccessibleName)
+                    ? button.Text
+                    : button.AccessibleName;
+                _windowToolTip.SetToolTip(button, string.IsNullOrWhiteSpace(text) ? "Button" : text);
+            }
+            ApplyMainButtonTooltips(child);
+        }
+    }
+
+    private string GetCaptureReadyMessage() =>
+        AppConfig.ParseHotkey(_config.CaptureKey).Modifiers.HasFlag(HotkeyModifiers.Alt)
+            ? $"Ready. Press {FormatConfiguredKey(_config.CaptureKey)} outside this window."
+            : $"Ready. Press {FormatConfiguredKey(_config.CaptureKey)} while this window is focused.";
 
     private void RefreshZoneUi()
     {
@@ -492,62 +807,67 @@ public sealed class MainForm : Form
         _countList.SuspendLayout();
         DisposeChildren(_countList);
         _countLabels.Clear();
+        _datasetCountStrip.SuspendLayout();
+        DisposeChildren(_datasetCountStrip);
+        _countStripLabels.Clear();
 
         foreach (ZoneConfig zone in _config.Zones)
         {
             if (!_counts.ContainsKey(zone.Name))
                 _counts[zone.Name] = 0;
 
+            string keyText = FormatConfiguredKey(zone.Key);
             var button = new RoundedButton
             {
-                Text = $"{FormatConfiguredKey(zone.Key)}   {zone.Name}",
-                Width = Math.Max(112, Math.Min(190, 96 + zone.Name.Length * 7)),
-                Height = 48,
-                Font = new Font("Consolas", 10f, FontStyle.Bold),
-                Margin = new Padding(0, 0, 8, 8),
+                Text = zone.Name,
+                KeyChipText = keyText,
+                Width = 96,
+                Height = 32,
+                Margin = new Padding(0, 0, 8, 0),
                 Enabled = _frameIsFrozen,
-                Accent = _pins.LastOrDefault()?.Zone is string activeZone
+                Selected = _pins.LastOrDefault()?.Zone is string activeZone
                     && string.Equals(activeZone, zone.Name, StringComparison.OrdinalIgnoreCase),
             };
+            button.Width = Math.Max(96, TextRenderer.MeasureText(zone.Name, button.Font).Width + 18 + 8 + 24);
             string zoneName = zone.Name;
             button.Click += (_, _) => AssignZone(zoneName);
+            _windowToolTip.SetToolTip(button, $"Label {zone.Name} ({keyText})");
             _zoneButtonsPanel.Controls.Add(button);
             _zoneButtons[zone.Name] = button;
 
-            var row = new Panel
+            var countRow = new ZoneCountRow(zone.Name, _counts[zone.Name], GetTargetCount(zone.Name))
             {
-                Width = 180,
-                Height = 34,
-                BackColor = Color.Transparent,
-                Margin = new Padding(0, 0, 0, 1),
+                Width = Math.Max(0, _countList.ClientSize.Width - SystemInformation.VerticalScrollBarWidth),
+                Height = 40,
+                Margin = Padding.Empty,
             };
-            var nameLabel = new Label
+            _countLabels[zone.Name] = countRow;
+            _countList.Controls.Add(countRow);
+
+            var stripLabel = new Label
             {
-                Text = zone.Name,
-                Dock = DockStyle.Fill,
+                AutoSize = false,
+                Text = $"{zone.Name}  {_counts[zone.Name]} / {GetTargetCount(zone.Name)}",
                 ForeColor = Theme.Text,
-                Font = new Font("Segoe UI", 9.5f),
+                Font = new Font("Consolas", 8.25f),
                 TextAlign = ContentAlignment.MiddleLeft,
-                Padding = new Padding(3, 0, 0, 0),
+                Height = 32,
+                Margin = new Padding(0, 0, 24, 0),
+                Padding = new Padding(0, 0, 0, 0),
             };
-            var countLabel = new Label
-            {
-                Text = _counts[zone.Name].ToString(),
-                Dock = DockStyle.Right,
-                Width = 56,
-                ForeColor = Theme.Accent,
-                Font = new Font("Consolas", 10f, FontStyle.Bold),
-                TextAlign = ContentAlignment.MiddleRight,
-                Padding = new Padding(0, 0, 7, 0),
-            };
-            row.Controls.Add(nameLabel);
-            row.Controls.Add(countLabel);
-            _countLabels[zone.Name] = countLabel;
-            _countList.Controls.Add(row);
+            stripLabel.Width = TextRenderer.MeasureText(stripLabel.Text, stripLabel.Font).Width + 2;
+            _countStripLabels[zone.Name] = stripLabel;
+            _datasetCountStrip.Controls.Add(stripLabel);
         }
 
         _zoneButtonsPanel.ResumeLayout(true);
+        ApplyMainButtonTooltips(_zoneButtonsPanel);
         _countList.ResumeLayout(true);
+        _datasetCountStrip.ResumeLayout(true);
+        if (_countList.Parent is Control countsFrame)
+            countsFrame.Height = Math.Min(320, _countList.Controls.Cast<Control>()
+                .Sum(control => control.Height + control.Margin.Vertical) + 2);
+        UpdateCountRowWidths();
         RefreshConfigUi();
         UpdateHotkeys();
     }
@@ -556,35 +876,48 @@ public sealed class MainForm : Form
     {
         if (_captureInProgress) return;
         _editingSettings = true;
-        UnregisterHotkeys();
+        UpdateHotkeyIndicator();
         try
         {
-            using var dialog = new SettingsDialog(_config, SaveSettingsFromDialog);
+            using var dialog = new SettingsDialog(_config, SaveSettingsFromDialog, PurgeDoneFromSettings);
             dialog.ShowDialog(this);
         }
         finally
         {
             _editingSettings = false;
             UpdateHotkeys();
+            UpdateHotkeyIndicator();
         }
     }
 
     private bool SaveSettingsFromDialog(AppConfig updated)
     {
-        updated.CropSize = _config.CropSize;
         updated.AlwaysOnTop = _config.AlwaysOnTop;
         updated.HideWhileCapturing = _config.HideWhileCapturing;
+        updated.MinPinSpacing = _config.MinPinSpacing;
+        if (WindowState == FormWindowState.Normal && !_isFullScreen)
+        {
+            updated.WindowX = Left;
+            updated.WindowY = Top;
+            updated.WindowWidth = Width;
+            updated.WindowHeight = Height;
+        }
+        else
+        {
+            updated.WindowX = _config.WindowX;
+            updated.WindowY = _config.WindowY;
+            updated.WindowWidth = _config.WindowWidth;
+            updated.WindowHeight = _config.WindowHeight;
+        }
         AppConfig.Validate(updated);
         WriteConfig(updated);
         _config = updated;
-        var oldCounts = new Dictionary<string, int>(_counts, StringComparer.OrdinalIgnoreCase);
-        _counts.Clear();
-        foreach (ZoneConfig zone in _config.Zones)
-            _counts[zone.Name] = oldCounts.GetValueOrDefault(zone.Name);
+        RecountLabels();
         bool removedAssignedZone = false;
         foreach (ScreenPin pin in _pins)
         {
-            if (pin.Zone is not null && !_counts.ContainsKey(pin.Zone))
+            if (pin.Zone is not null
+                && !_config.Zones.Any(zone => string.Equals(zone.Name, pin.Zone, StringComparison.OrdinalIgnoreCase)))
             {
                 pin.Zone = null;
                 pin.Exported = false;
@@ -626,6 +959,50 @@ public sealed class MainForm : Form
         }
     }
 
+    private void RestoreWindowBounds()
+    {
+        bool hasSavedBounds = _config.WindowX.HasValue
+            && _config.WindowY.HasValue
+            && _config.WindowWidth.HasValue
+            && _config.WindowHeight.HasValue;
+        Rectangle bounds = hasSavedBounds
+            ? new Rectangle(_config.WindowX!.Value, _config.WindowY!.Value,
+                _config.WindowWidth!.Value, _config.WindowHeight!.Value)
+            : Bounds;
+        Screen primary = Screen.PrimaryScreen ?? Screen.FromControl(this);
+        Screen screen = hasSavedBounds
+            ? Screen.AllScreens.FirstOrDefault(candidate => candidate.WorkingArea.IntersectsWith(bounds)) ?? primary
+            : primary;
+        Rectangle workingArea = screen.WorkingArea;
+        MinimumSize = new Size(Math.Min(800, workingArea.Width), Math.Min(600, workingArea.Height));
+        if (!hasSavedBounds)
+            bounds.Location = new Point(
+                workingArea.Left + (workingArea.Width - bounds.Width) / 2,
+                workingArea.Top + (workingArea.Height - bounds.Height) / 2);
+        int width = Math.Clamp(bounds.Width, MinimumSize.Width, workingArea.Width);
+        int height = Math.Clamp(bounds.Height, MinimumSize.Height, workingArea.Height);
+        int x = Math.Clamp(bounds.X, workingArea.Left, workingArea.Right - width);
+        int y = Math.Clamp(bounds.Y, workingArea.Top, workingArea.Bottom - height);
+        Bounds = new Rectangle(x, y, width, height);
+    }
+
+    private void ScheduleWindowBoundsSave()
+    {
+        if (WindowState != FormWindowState.Normal || _isFullScreen || !IsHandleCreated) return;
+        _boundsSaveTimer.Stop();
+        _boundsSaveTimer.Start();
+    }
+
+    private void SaveWindowBounds()
+    {
+        if (WindowState != FormWindowState.Normal || _isFullScreen) return;
+        _config.WindowX = Left;
+        _config.WindowY = Top;
+        _config.WindowWidth = Width;
+        _config.WindowHeight = Height;
+        SaveCurrentConfig();
+    }
+
     private void WriteConfig(AppConfig config)
     {
         string temporaryPath = _configPath + ".tmp";
@@ -640,29 +1017,42 @@ public sealed class MainForm : Form
     private void RegisterHotkeys()
     {
         UnregisterHotkeys();
-        if (_editingSettings) return;
         _hotkeyRegistrationFailed = false;
 
-        RegisterHotkey(CaptureHotkeyId, AppConfig.ParseKey(_config.CaptureKey));
-        RegisterHotkey(DiscardHotkeyId, AppConfig.ParseKey(_config.DiscardKey));
+        HotkeyBinding captureHotkey = AppConfig.ParseHotkey(_config.CaptureKey);
+        if (captureHotkey.Modifiers.HasFlag(HotkeyModifiers.Alt))
+            RegisterHotkey(CaptureHotkeyId, captureHotkey);
+        HotkeyBinding discardHotkey = AppConfig.ParseHotkey(_config.DiscardKey);
+        if (discardHotkey.Modifiers.HasFlag(HotkeyModifiers.Alt))
+            RegisterHotkey(DiscardHotkeyId, discardHotkey);
         for (int index = 0; index < _config.Zones.Count; index++)
-            RegisterHotkey(ZoneHotkeyBase + index, AppConfig.ParseKey(_config.Zones[index].Key));
+        {
+            HotkeyBinding zoneHotkey = AppConfig.ParseHotkey(_config.Zones[index].Key);
+            if (zoneHotkey.Modifiers.HasFlag(HotkeyModifiers.Alt))
+                RegisterHotkey(ZoneHotkeyBase + index, zoneHotkey);
+        }
 
         if (_hotkeyRegistrationFailed)
             SetStatus("A global hotkey is in use by another app; click the window to use shortcuts.", true);
+        UpdateHotkeyIndicator();
     }
 
-    private void RegisterHotkey(int id, Keys key)
+    private void RegisterHotkey(int id, HotkeyBinding hotkey)
     {
-        if (key == Keys.None) return;
-        if (RegisterHotKey(Handle, id, ModNoRepeat, (uint)key))
+        if (hotkey.Key == Keys.None || !hotkey.Modifiers.HasFlag(HotkeyModifiers.Alt)) return;
+        uint modifiers = ModNoRepeat;
+        if (hotkey.Modifiers.HasFlag(HotkeyModifiers.Control)) modifiers |= ModControl;
+        if (hotkey.Modifiers.HasFlag(HotkeyModifiers.Alt)) modifiers |= ModAlt;
+        if (hotkey.Modifiers.HasFlag(HotkeyModifiers.Shift)) modifiers |= ModShift;
+        if (hotkey.Modifiers.HasFlag(HotkeyModifiers.Windows)) modifiers |= ModWindows;
+        if (RegisterHotKey(Handle, id, modifiers, (uint)hotkey.Key))
         {
             _registeredHotkeys.Add(id);
             return;
         }
 
         _hotkeyRegistrationFailed = true;
-        Log.Error($"RegisterHotKey({AppConfig.FormatKey(key)}) failed: {new Win32Exception(Marshal.GetLastWin32Error()).Message}");
+        Log.Error($"RegisterHotKey({AppConfig.FormatHotkey(hotkey)}) failed: {new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()).Message}");
     }
 
     private void UpdateHotkeys()
@@ -706,10 +1096,10 @@ public sealed class MainForm : Form
 
         if (message.Msg == WmHotkey)
         {
-            if (_editingSettings || _captureInProgress) return;
+            if (IsTextInputFocused() || _captureInProgress) return;
             int id = message.WParam.ToInt32();
             if (id == CaptureHotkeyId)
-                _ = CaptureRequested();
+                _ = CaptureRequested(requirePointerOutside: true);
             else if (id == DiscardHotkeyId)
                 DiscardPins();
             else if (id >= ZoneHotkeyBase && id < ZoneHotkeyBase + _config.Zones.Count)
@@ -739,48 +1129,93 @@ public sealed class MainForm : Form
 
     private void OnFormKeyDown(object? sender, KeyEventArgs e)
     {
-        if (_editingSettings) return;
-        bool f11IsAssigned = AppConfig.ParseKey(_config.CaptureKey) == Keys.F11
-            || AppConfig.ParseKey(_config.DiscardKey) == Keys.F11
-            || _config.Zones.Any(zone => AppConfig.ParseKey(zone.Key) == Keys.F11);
-        if (e.KeyCode == Keys.F11 && !f11IsAssigned)
+        if (_editingSettings || IsTextInputFocused() || !_preview.Focused) return;
+        if (e.KeyCode == Keys.Escape
+            && HotkeyBinding.ReadModifiers(e.Modifiers) == HotkeyModifiers.None
+            && _preview.CancelPan())
+        {
+            e.Handled = true;
+            e.SuppressKeyPress = true;
+            return;
+        }
+        if (e.Control && e.KeyCode is >= Keys.D1 and <= Keys.D6
+            && HotkeyBinding.ReadModifiers(e.Modifiers) == HotkeyModifiers.Control)
+        {
+            int zoneIndex = (int)e.KeyCode - (int)Keys.D1;
+            if (zoneIndex < _config.Zones.Count)
+                AssignZone(_config.Zones[zoneIndex].Name);
+            e.Handled = true;
+            e.SuppressKeyPress = true;
+            return;
+        }
+
+        if (e.KeyCode == Keys.Z
+            && HotkeyBinding.ReadModifiers(e.Modifiers) == HotkeyModifiers.Control)
+        {
+            UndoLastPin();
+            e.Handled = true;
+            e.SuppressKeyPress = true;
+            return;
+        }
+
+        bool f11IsAssigned = IsUnmodifiedF11(_config.CaptureKey)
+            || IsUnmodifiedF11(_config.DiscardKey)
+            || _config.Zones.Any(zone => IsUnmodifiedF11(zone.Key));
+        bool escapeIsAssigned = IsUnmodifiedEscape(_config.CaptureKey)
+            || IsUnmodifiedEscape(_config.DiscardKey)
+            || _config.Zones.Any(zone => IsUnmodifiedEscape(zone.Key));
+        if (e.KeyCode == Keys.F11
+            && HotkeyBinding.ReadModifiers(e.Modifiers) == HotkeyModifiers.None
+            && !f11IsAssigned)
         {
             ToggleFullScreen();
             e.Handled = true;
             e.SuppressKeyPress = true;
         }
-        else if (_isFullScreen && e.KeyCode == Keys.Escape)
+        else if (_isFullScreen && e.KeyCode == Keys.Escape
+            && HotkeyBinding.ReadModifiers(e.Modifiers) == HotkeyModifiers.None
+            && !escapeIsAssigned)
         {
             ToggleFullScreen();
             e.Handled = true;
             e.SuppressKeyPress = true;
         }
-        else if (e.KeyCode == AppConfig.ParseKey(_config.CaptureKey)
+        else if (AppConfig.ParseHotkey(_config.CaptureKey).Matches(e.KeyCode, e.Modifiers)
             && !_registeredHotkeys.Contains(CaptureHotkeyId))
         {
-            _ = CaptureRequested();
+            HotkeyBinding captureHotkey = AppConfig.ParseHotkey(_config.CaptureKey);
+            _ = CaptureRequested(requirePointerOutside: captureHotkey.Modifiers.HasFlag(HotkeyModifiers.Alt));
             e.Handled = true;
+            e.SuppressKeyPress = true;
         }
-        else if (e.KeyCode == AppConfig.ParseKey(_config.DiscardKey)
+        else if (AppConfig.ParseHotkey(_config.DiscardKey).Matches(e.KeyCode, e.Modifiers)
             && !_registeredHotkeys.Contains(DiscardHotkeyId))
         {
             DiscardPins();
             e.Handled = true;
+            e.SuppressKeyPress = true;
         }
         else
         {
-            int zoneIndex = _config.Zones.FindIndex(zone => AppConfig.ParseKey(zone.Key) == e.KeyCode);
+            int zoneIndex = _config.Zones.FindIndex(zone =>
+                AppConfig.ParseHotkey(zone.Key).Matches(e.KeyCode, e.Modifiers));
             if (zoneIndex >= 0 && !_registeredHotkeys.Contains(ZoneHotkeyBase + zoneIndex))
             {
                 AssignZone(_config.Zones[zoneIndex].Name);
                 e.Handled = true;
+                e.SuppressKeyPress = true;
             }
         }
     }
 
-    private async Task CaptureRequested()
+    private async Task CaptureRequested(bool requirePointerOutside = false)
     {
         if (_captureInProgress || _editingSettings) return;
+        if (requirePointerOutside && Bounds.Contains(Cursor.Position))
+        {
+            SetStatus("Move the pointer outside ZoneLab, then press the capture shortcut.", true);
+            return;
+        }
         _captureInProgress = true;
         try
         {
@@ -793,7 +1228,14 @@ public sealed class MainForm : Form
             if (_frameIsFrozen && _pins.Any(pin => !pin.Exported))
             {
                 SavePins();
+            }
+
+            if (_frameIsFrozen && _pins.Count > 0)
+            {
+                if (!PersistPinsOrReport())
+                    return;
                 _pins.Clear();
+                _preview.RefreshPinSpacingWarnings();
                 _preview.Invalidate();
             }
 
@@ -823,7 +1265,7 @@ public sealed class MainForm : Form
             }
 
             if (_preview.Frame is not null)
-                SetStatus($"Captured {_preview.Frame.Width}×{_preview.Frame.Height}. Click targets to add pins; {FormatConfiguredKey(_config.CaptureKey)} saves and advances.");
+                SetStatus($"Captured {_preview.Frame.Width}×{_preview.Frame.Height}. Click targets to add pins; {FormatConfiguredKey(_config.CaptureKey)} captures another frame.");
         }
         catch (Exception ex)
         {
@@ -913,22 +1355,39 @@ public sealed class MainForm : Form
         if (dialog.ShowDialog(this) != DialogResult.OK || dialog.SelectedCapturePath is null)
             return;
 
+        TryOpenGalleryCapture(dialog.SelectedCapturePath);
+    }
+
+    private bool TryOpenGalleryCapture(string imagePath)
+    {
         try
         {
-            using var source = new Bitmap(dialog.SelectedCapturePath);
+            using var source = new Bitmap(imagePath);
             var frame = new Bitmap(source);
-            GalleryCapture capture = LoadGalleryState(dialog.SelectedCapturePath, frame.Size);
-            SetCurrentGalleryCapture(dialog.SelectedCapturePath, frame, capture);
-            string collection = CaptureFileOperations.IsCompleted(dialog.SelectedCapturePath, _doneDirectory)
+            GalleryCapture capture = LoadGalleryState(imagePath, frame.Size);
+            SetCurrentGalleryCapture(imagePath, frame, capture);
+            string collection = CaptureFileOperations.IsCompleted(imagePath, _doneDirectory)
                 ? "done"
                 : "todo";
-            SetStatus($"Opened {Path.GetFileName(dialog.SelectedCapturePath)} from {collection}. Scroll to zoom; middle-drag to pan.");
+            SetStatus($"Opened {Path.GetFileName(imagePath)} from {collection}. Scroll to zoom; right-drag to pan.");
+            return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or System.Text.Json.JsonException or InvalidDataException)
         {
-            Log.Error($"opening gallery capture failed: {dialog.SelectedCapturePath}", ex);
+            Log.Error($"opening gallery capture failed: {imagePath}", ex);
             SetStatus("Could not open that gallery capture. See dataset/capture.log.", true);
+            return false;
         }
+    }
+
+    private string? FindNextTodoCapture()
+    {
+        return new[] { _todoDirectory, _legacyGalleryDirectory }
+            .Where(Directory.Exists)
+            .SelectMany(directory => Directory.GetFiles(directory, "*.png", SearchOption.TopDirectoryOnly))
+            .Where(path => !CaptureFileOperations.IsCompleted(path, _doneDirectory))
+            .OrderBy(File.GetLastWriteTimeUtc)
+            .FirstOrDefault();
     }
 
     private GalleryCapture LoadGalleryState(string imagePath, Size frameSize)
@@ -963,16 +1422,20 @@ public sealed class MainForm : Form
         _currentGalleryPath = path;
         _currentGallery = capture;
         _pins.Clear();
+        _placedPins.Clear();
         _pins.AddRange(capture.Pins.Select(pin => new ScreenPin(pin.X, pin.Y)
         {
             Zone = pin.Zone,
             Exported = pin.Exported,
         }));
+        _preview.RefreshPinSpacingWarnings();
         _frameIsFrozen = true;
         RefreshZoneButtonEnabledState();
         UpdateActiveZoneButton();
         UpdateDoneButtonState();
         _preview.Invalidate();
+        _preview.SelectedPin = _pins.LastOrDefault();
+        UpdateCropPreview(_preview.HoveredPin);
     }
 
     private void CompleteCurrentCapture()
@@ -996,21 +1459,35 @@ public sealed class MainForm : Form
             return;
         }
 
+        string completedPath;
         try
         {
             SavePins();
             if (!PersistPinsOrReport())
                 return;
 
-            _currentGalleryPath = CaptureFileOperations.MoveToDone(_currentGalleryPath, _doneDirectory);
-            UpdateDoneButtonState();
-            SetStatus("Capture completed and moved to dataset/done. Labeled crops are in dataset/data.");
+            completedPath = CaptureFileOperations.MoveToDone(_currentGalleryPath, _doneDirectory);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException or InvalidDataException)
         {
             Log.Error("completing capture failed", ex);
             SetStatus($"Could not complete this capture. See {Log.FilePath}", true);
+            return;
         }
+
+        _currentGalleryPath = completedPath;
+        UpdateDoneButtonState();
+        string? nextCapture = FindNextTodoCapture();
+        if (nextCapture is null)
+        {
+            SetStatus($"Capture completed: {Path.GetFileName(completedPath)}. No more todo images; crops are in dataset/data.");
+            return;
+        }
+
+        if (TryOpenGalleryCapture(nextCapture))
+            SetStatus($"Completed {Path.GetFileName(completedPath)}. Next image: {Path.GetFileName(nextCapture)}.");
+        else
+            SetStatus($"Capture completed, but the next image could not be opened. See {Log.FilePath}.", true);
     }
 
     private void UpdateDoneButtonState() =>
@@ -1058,22 +1535,74 @@ public sealed class MainForm : Form
     private void AddPin(Point location)
     {
         if (!_frameIsFrozen || _preview.Frame is null) return;
-        _pins.Add(new ScreenPin(location.X, location.Y));
+        var pin = new ScreenPin(location.X, location.Y);
+        bool tooClose = _pins.Any(existing => ArePinsTooClose(pin, existing));
+        _pins.Add(pin);
+        _placedPins.Add(pin);
+        _preview.RefreshPinSpacingWarnings();
+        _preview.SelectedPin = pin;
         bool saved = PersistPinsOrReport();
         _preview.Invalidate();
-        if (saved)
+        UpdateCropPreview(pin);
+        if (tooClose)
+            SetStatus(saved
+                ? $"Too close: pins must be at least {_config.MinPinSpacing}px apart."
+                : $"Too close. Pin is active but could not be saved; see {Log.FilePath}.", true);
+        else if (saved)
             SetStatus($"Pin {_pins.Count} added at ({location.X}, {location.Y}). Assign a zone with a hotkey or button.");
     }
 
     private void DeletePin(ScreenPin pin)
     {
+        RemovePin(pin);
+    }
+
+    private bool RemovePin(ScreenPin pin)
+    {
         int index = _pins.IndexOf(pin);
-        if (index < 0) return;
+        if (index < 0) return false;
         _pins.RemoveAt(index);
+        _placedPins.Remove(pin);
+        _preview.RefreshPinSpacingWarnings();
+        if (ReferenceEquals(_preview.SelectedPin, pin))
+            _preview.SelectedPin = _pins.LastOrDefault();
+        _preview.ClearHoveredPin(pin);
         UpdateActiveZoneButton();
         bool saved = PersistPinsOrReport();
         _preview.Invalidate();
+        UpdateCropPreview(_preview.HoveredPin);
         if (saved) SetStatus($"Pin {index + 1} removed.");
+        return saved;
+    }
+
+    private void UndoLastPin()
+    {
+        while (_placedPins.Count > 0)
+        {
+            ScreenPin pin = _placedPins[^1];
+            _placedPins.RemoveAt(_placedPins.Count - 1);
+            if (!_pins.Contains(pin)) continue;
+
+            bool saved = RemovePin(pin);
+            if (!saved) return;
+            if (_pins.Any(existing => _pins.Any(other => !ReferenceEquals(existing, other)
+                    && ArePinsTooClose(existing, other))))
+                SetStatus($"Too close: pins must be at least {_config.MinPinSpacing}px apart.", true);
+            else
+                SetStatus($"Undid the most recently placed pin. {_pins.Count} pin(s) remain.");
+            return;
+        }
+
+        SetStatus("There are no newly placed pins to undo.");
+    }
+
+    private bool ArePinsTooClose(ScreenPin first, ScreenPin second)
+    {
+        if (_config.MinPinSpacing <= 0) return false;
+        long dx = first.X - second.X;
+        long dy = first.Y - second.Y;
+        long spacing = _config.MinPinSpacing;
+        return dx * dx + dy * dy <= spacing * spacing;
     }
 
     private void AssignZone(string zoneName)
@@ -1091,7 +1620,7 @@ public sealed class MainForm : Form
         pin.Exported = false;
         pin.Confirming = true;
         foreach (var (name, button) in _zoneButtons)
-            button.Accent = string.Equals(name, zoneName, StringComparison.OrdinalIgnoreCase);
+            button.Selected = string.Equals(name, zoneName, StringComparison.OrdinalIgnoreCase);
         _pinFlashTimer.Stop();
         _pinFlashTimer.Start();
         bool saved = PersistPinsOrReport();
@@ -1099,7 +1628,19 @@ public sealed class MainForm : Form
         if (saved) SetStatus($"Pin {_pins.Count} assigned to {zoneName}.");
     }
 
-    private void DiscardPins()
+    private void SaveCurrentProgress()
+    {
+        if (!_frameIsFrozen || _currentGalleryPath is null)
+        {
+            SetStatus("There is no current capture to save.", true);
+            return;
+        }
+
+        if (PersistPinsOrReport())
+            SetStatus("Current capture and pin progress saved. Crops were not exported.");
+    }
+
+    private void DiscardPins(bool bypassWarning = false)
     {
         if (_pins.Count == 0)
         {
@@ -1107,11 +1648,26 @@ public sealed class MainForm : Form
             return;
         }
 
+        if (!bypassWarning
+            && MessageBox.Show(this,
+                "Remove all pins from the current image? Already exported crops will remain in dataset/data. Double-click Discard to skip this warning.",
+                "Discard pins",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+        {
+            return;
+        }
+
         int removed = _pins.Count;
         _pins.Clear();
+        _placedPins.Clear();
+        _preview.RefreshPinSpacingWarnings();
+        _preview.SelectedPin = null;
         UpdateActiveZoneButton();
         bool saved = PersistPinsOrReport();
         _preview.Invalidate();
+        UpdateCropPreview(null);
         if (saved) SetStatus($"Discarded {removed} pin(s). The frozen frame is unchanged.");
     }
 
@@ -1134,12 +1690,11 @@ public sealed class MainForm : Form
             {
                 ScreenPin pin = pendingPins[index];
                 string zone = pin.Zone ?? throw new InvalidOperationException("A pin has no zone label.");
-                Rectangle cropBounds = GetCropBounds(pin, frame.Size, _config.CropSize);
                 string filename = $"{timestamp}_{SafeFilenamePart(zone)}_{index + 1}.png";
                 string outputPath = Path.Combine(_imageDirectory, filename);
                 string temporaryPath = outputPath + ".tmp";
 
-                using (var crop = frame.Clone(cropBounds, PixelFormat.Format32bppArgb))
+                using (var crop = CreateCropImage(frame, pin))
                     crop.Save(temporaryPath, ImageFormat.Png);
                 temporaryFiles.Add(temporaryPath);
                 File.Move(temporaryPath, outputPath);
@@ -1148,7 +1703,7 @@ public sealed class MainForm : Form
 
                 int screenX = _currentGallery.ScreenLeft + pin.X;
                 int screenY = _currentGallery.ScreenTop + pin.Y;
-                rows.Add(CsvRow(filename, zone, cropBounds.Width, cropBounds.Height, screenX, screenY));
+                rows.Add(CsvRow(filename, zone, CropSize, CropSize, screenX, screenY));
             }
 
             AppendCsvRows(rows);
@@ -1169,13 +1724,14 @@ public sealed class MainForm : Form
             throw;
         }
 
+        bool countsRefreshed = RecountLabels();
         foreach (ScreenPin pin in pendingPins)
-        {
             pin.Exported = true;
-            SetCount(pin.Zone!, _counts.GetValueOrDefault(pin.Zone!) + 1);
-        }
         SaveGalleryState();
-        SetStatus($"Saved {pendingPins.Length} labelled crop(s) to dataset/data. Capture and pin progress remain in dataset/todo.");
+        SetStatus(countsRefreshed
+            ? $"Saved {pendingPins.Length} labelled crop(s) to dataset/data. Capture and pin progress remain in dataset/todo."
+            : $"Saved {pendingPins.Length} labelled crop(s), but counts could not be refreshed. See {Log.FilePath}.",
+            !countsRefreshed);
     }
 
     private string CreateUniqueTimestamp(IReadOnlyList<ScreenPin> pendingPins)
@@ -1203,13 +1759,34 @@ public sealed class MainForm : Form
         }
     }
 
-    private static Rectangle GetCropBounds(ScreenPin pin, Size frameSize, int requestedSize)
+    private static Bitmap CreateCropImage(Bitmap frame, ScreenPin pin)
     {
-        int width = Math.Min(requestedSize, frameSize.Width);
-        int height = Math.Min(requestedSize, frameSize.Height);
-        int x = Math.Clamp(pin.X - width / 2, 0, frameSize.Width - width);
-        int y = Math.Clamp(pin.Y - height / 2, 0, frameSize.Height - height);
-        return new Rectangle(x, y, width, height);
+        const int halfSize = CropSize / 2;
+        int left = pin.X - halfSize;
+        int top = pin.Y - halfSize;
+        var crop = new Bitmap(CropSize, CropSize, PixelFormat.Format32bppArgb);
+        try
+        {
+            using Graphics graphics = Graphics.FromImage(crop);
+            graphics.Clear(Color.Black);
+            Rectangle source = Rectangle.Intersect(
+                new Rectangle(left, top, CropSize, CropSize),
+                new Rectangle(Point.Empty, frame.Size));
+            if (!source.IsEmpty)
+            {
+                var destination = new Rectangle(source.X - left, source.Y - top, source.Width, source.Height);
+                graphics.CompositingMode = CompositingMode.SourceCopy;
+                graphics.InterpolationMode = InterpolationMode.Bilinear;
+                graphics.PixelOffsetMode = PixelOffsetMode.Half;
+                graphics.DrawImage(frame, destination, source, GraphicsUnit.Pixel);
+            }
+            return crop;
+        }
+        catch
+        {
+            crop.Dispose();
+            throw;
+        }
     }
 
     private void AppendCsvRows(IReadOnlyCollection<string> rows)
@@ -1261,8 +1838,156 @@ public sealed class MainForm : Form
     private void SetCount(string zone, int count)
     {
         _counts[zone] = count;
-        if (_countLabels.TryGetValue(zone, out Label? label))
-            label.Text = count.ToString();
+        int target = GetTargetCount(zone);
+        if (_countLabels.TryGetValue(zone, out ZoneCountRow? row))
+            row.SetCount(count, target);
+        if (_countStripLabels.TryGetValue(zone, out Label? stripLabel))
+        {
+            stripLabel.Text = $"{zone}  {count} / {target}";
+            stripLabel.Width = TextRenderer.MeasureText(stripLabel.Text, stripLabel.Font).Width + 2;
+        }
+    }
+
+    private void UpdateCountRowWidths()
+    {
+        int contentHeight = _countList.Controls.Cast<Control>()
+            .Sum(control => control.Height + control.Margin.Vertical);
+        int scrollbarWidth = contentHeight > _countList.ClientSize.Height
+            ? SystemInformation.VerticalScrollBarWidth
+            : 0;
+        int rowWidth = Math.Max(0, _countList.ClientSize.Width - scrollbarWidth);
+        foreach (ZoneCountRow row in _countLabels.Values)
+            row.Width = rowWidth;
+    }
+
+    private bool RecountLabels()
+    {
+        var recount = _config.Zones.ToDictionary(zone => zone.Name, _ => 0, StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            if (File.Exists(_csvPath))
+            {
+                foreach (string line in File.ReadLines(_csvPath))
+                {
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    string[] fields = ParseCsvFields(line);
+                    if (fields.Length < 2
+                        || string.Equals(fields[0], "filename", StringComparison.OrdinalIgnoreCase)
+                        && string.Equals(fields[1], "zone", StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    if (recount.ContainsKey(fields[1]))
+                        recount[fields[1]]++;
+                }
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException)
+        {
+            Log.Error("recounting labels.csv failed", ex);
+            if (IsHandleCreated)
+                SetStatus($"Could not read dataset/labels.csv; counts were not refreshed. See {Log.FilePath}.", true);
+            return false;
+        }
+
+        _counts.Clear();
+        foreach (ZoneConfig zone in _config.Zones)
+            SetCount(zone.Name, recount[zone.Name]);
+        return true;
+    }
+
+    private static string[] ParseCsvFields(string line)
+    {
+        var fields = new List<string>();
+        var field = new StringBuilder();
+        bool quoted = false;
+        for (int index = 0; index < line.Length; index++)
+        {
+            char character = line[index];
+            if (quoted)
+            {
+                if (character == '"' && index + 1 < line.Length && line[index + 1] == '"')
+                {
+                    field.Append('"');
+                    index++;
+                }
+                else if (character == '"')
+                {
+                    quoted = false;
+                }
+                else
+                {
+                    field.Append(character);
+                }
+            }
+            else if (character == ',' )
+            {
+                fields.Add(field.ToString());
+                field.Clear();
+            }
+            else if (character == '"' && field.Length == 0)
+            {
+                quoted = true;
+            }
+            else
+            {
+                field.Append(character);
+            }
+        }
+
+        if (quoted)
+            throw new InvalidDataException("A quoted field in labels.csv was not closed.");
+        fields.Add(field.ToString());
+        return fields.ToArray();
+    }
+
+    private int GetTargetCount(string zone)
+    {
+        foreach ((string name, int count) in _config.TargetCounts)
+        {
+            if (string.Equals(name, zone, StringComparison.OrdinalIgnoreCase))
+                return count;
+        }
+        return 0;
+    }
+
+    private void UpdateCropPreview(ScreenPin? pin)
+    {
+        ScreenPin? target = pin ?? _preview.SelectedPin ?? _pins.LastOrDefault();
+        _cropPreview.ShowCrop(_preview.Frame, target);
+        if (_cropPreviewSurface is not null)
+            _cropPreviewSurface.Visible = _preview.Frame is not null && target is not null;
+    }
+
+    private void PurgeDoneOnStartup()
+    {
+        try
+        {
+            int? removed = CaptureFileOperations.PurgeDone(_doneDirectory, _config.DoneRetentionDays);
+            if (removed.HasValue)
+                Log.Info($"done purge removed {removed.Value} file(s).");
+        }
+        catch (Exception ex)
+        {
+            Log.Error("automatic done purge failed", ex);
+        }
+    }
+
+    private string PurgeDoneFromSettings()
+    {
+        try
+        {
+            int? removed = CaptureFileOperations.PurgeDone(_doneDirectory, _config.DoneRetentionDays);
+            if (!removed.HasValue)
+                return "No dataset\\done folder exists.";
+            Log.Info($"manual done purge removed {removed.Value} file(s).");
+            SetStatus($"Purged {removed.Value} file(s) from dataset/done.");
+            return $"Removed {removed.Value} file(s).";
+        }
+        catch (Exception ex)
+        {
+            Log.Error("manual done purge failed", ex);
+            SetStatus($"Could not purge dataset/done. See {Log.FilePath}.", true);
+            return "Purge failed; see capture.log.";
+        }
     }
 
     private static void DisposeChildren(Control parent)
@@ -1274,15 +1999,10 @@ public sealed class MainForm : Form
         }
     }
 
-    private void ResetCounts()
+    private void RefreshCounts()
     {
-        if (MessageBox.Show(this, "Reset the displayed counts? Existing dataset images and CSV rows will not be changed.",
-                "Reset counts", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
-            return;
-
-        foreach (ZoneConfig zone in _config.Zones)
-            SetCount(zone.Name, 0);
-        SetStatus("Counts reset. Existing files were left untouched.");
+        if (RecountLabels())
+            SetStatus("Counts refreshed from dataset/labels.csv.");
     }
 
     private void OpenDatasetFolder()
@@ -1321,20 +2041,81 @@ public sealed class MainForm : Form
     {
         string? activeZone = _pins.LastOrDefault()?.Zone;
         foreach (var (name, button) in _zoneButtons)
-            button.Accent = activeZone is not null
+            button.Selected = activeZone is not null
                 && string.Equals(name, activeZone, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsUnmodifiedF11(string value)
+    {
+        HotkeyBinding binding = AppConfig.ParseHotkey(value);
+        return binding.Key == Keys.F11 && binding.Modifiers == HotkeyModifiers.None;
+    }
+
+    private static bool IsUnmodifiedEscape(string value)
+    {
+        HotkeyBinding binding = AppConfig.ParseHotkey(value);
+        return binding.Key == Keys.Escape && binding.Modifiers == HotkeyModifiers.None;
     }
 
     private static string FormatConfiguredKey(string value)
     {
-        Keys key = AppConfig.ParseKey(value);
-        return key == Keys.None ? "—" : AppConfig.FormatKey(key);
+        HotkeyBinding hotkey = AppConfig.ParseHotkey(value);
+        return hotkey.Key == Keys.None ? "—" : AppConfig.FormatHotkey(hotkey);
     }
 
     private void SetStatus(string message, bool error = false)
     {
         _statusLabel.Text = message;
         _statusLabel.ForeColor = error ? Theme.Warn : Theme.Muted;
+        _statusIcon.Text = error ? "!" : "●";
+        _statusIcon.ForeColor = error ? Theme.Warn : Theme.Success;
+    }
+
+    private void AttachHotkeyFocusEvents(Control parent)
+    {
+        parent.GotFocus += (_, _) => UpdateHotkeyIndicator();
+        parent.LostFocus += (_, _) => UpdateHotkeyIndicator();
+        foreach (Control child in parent.Controls)
+            AttachHotkeyFocusEvents(child);
+    }
+
+    private bool IsTextInputFocused()
+    {
+        Control focusRoot = Form.ActiveForm ?? this;
+        Control? focused = FindFocusedControl(focusRoot);
+        return focused is TextBoxBase or ComboBox or UpDownBase;
+    }
+
+    private static Control? FindFocusedControl(Control parent)
+    {
+        if (parent.Focused) return parent;
+        foreach (Control child in parent.Controls)
+        {
+            if (child.ContainsFocus)
+                return FindFocusedControl(child);
+        }
+        return null;
+    }
+
+    private void UpdateHotkeyIndicator()
+    {
+        if (_hotkeyIndicator is null || _preview is null) return;
+        bool textInputFocused = IsTextInputFocused();
+        bool hasGlobalBinding = _registeredHotkeys.Count > 0;
+        bool hasCanvasBinding = AppConfig.ParseHotkey(_config.CaptureKey).Key != Keys.None
+                && !_registeredHotkeys.Contains(CaptureHotkeyId)
+            || AppConfig.ParseHotkey(_config.DiscardKey).Key != Keys.None
+                && !_registeredHotkeys.Contains(DiscardHotkeyId)
+            || _config.Zones.Select((zone, index) => (zone, index))
+                .Any(item => AppConfig.ParseHotkey(item.zone.Key).Key != Keys.None
+                    && !_registeredHotkeys.Contains(ZoneHotkeyBase + item.index));
+        bool live = !textInputFocused
+            && (hasGlobalBinding || _preview.Focused && hasCanvasBinding);
+        _hotkeyIndicator.ForeColor = live ? Theme.Success : Theme.Muted;
+        _hotkeyIndicator.AccessibleName = live ? "Hotkeys live" : "Hotkeys suppressed";
+        _windowToolTip.SetToolTip(_hotkeyIndicator, live
+            ? "Hotkeys live: Alt bindings are global; other bindings work on the canvas."
+            : "Hotkeys are suppressed while text input has focus or the canvas is unfocused.");
     }
 
     private void DragWindow(object? sender, MouseEventArgs e)
@@ -1348,6 +2129,8 @@ public sealed class MainForm : Form
     {
         if (!_isFullScreen)
         {
+            SaveWindowBounds();
+            _boundsSaveTimer.Stop();
             _restoreBounds = Bounds;
             Screen screen = Screen.FromControl(this);
             _isFullScreen = true;
@@ -1386,27 +2169,27 @@ public sealed class MainForm : Form
             return;
         }
         if (Width <= 0 || Height <= 0) return;
-        using var path = RoundedButton.CreateRoundRectangle(new Rectangle(0, 0, Width, Height), 16);
         Region? previous = Region;
-        Region = new Region(path);
+        Region = null;
         previous?.Dispose();
     }
 
     protected override void OnPaint(PaintEventArgs e)
     {
         base.OnPaint(e);
-        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
         using var pen = new Pen(Theme.Border, 1);
-        using var path = RoundedButton.CreateRoundRectangle(new Rectangle(0, 0, Width - 1, Height - 1), 16);
-        e.Graphics.DrawPath(pen, path);
+        e.Graphics.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
+        _boundsSaveTimer.Stop();
+        SaveWindowBounds();
         foreach (int id in _registeredHotkeys)
             UnregisterHotKey(Handle, id);
         _registeredHotkeys.Clear();
         _pinFlashTimer.Stop();
+        _discardClickTimer.Stop();
         if (_timerResolutionAcquired)
             timeEndPeriod(1);
         base.OnFormClosing(e);
@@ -1417,6 +2200,8 @@ public sealed class MainForm : Form
         if (disposing)
         {
             _pinFlashTimer.Dispose();
+            _discardClickTimer.Dispose();
+            _boundsSaveTimer.Dispose();
             _windowToolTip.Dispose();
             _preview.Frame?.Dispose();
             Region?.Dispose();
@@ -1424,35 +2209,333 @@ public sealed class MainForm : Form
         base.Dispose(disposing);
     }
 
+    private sealed class CropPreview : Control
+    {
+        private Bitmap? _crop;
+
+        public CropPreview()
+        {
+            Size = new Size(194, 194);
+            BackColor = Color.Black;
+            SetStyle(ControlStyles.OptimizedDoubleBuffer
+                     | ControlStyles.AllPaintingInWmPaint
+                     | ControlStyles.UserPaint
+                     | ControlStyles.ResizeRedraw, true);
+        }
+
+        public void ShowCrop(Bitmap? frame, ScreenPin? pin)
+        {
+            Bitmap? next = null;
+            if (frame is not null && pin is not null)
+            {
+                try
+                {
+                    next = CreateCropImage(frame, pin);
+                }
+                catch (Exception ex)
+                {
+                    Log.Error("updating crop preview failed", ex);
+                }
+            }
+
+            Bitmap? previous = _crop;
+            _crop = next;
+            previous?.Dispose();
+            Invalidate();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.Clear(Color.Black);
+            try
+            {
+                if (_crop is not null)
+                {
+                    e.Graphics.InterpolationMode = InterpolationMode.NearestNeighbor;
+                    e.Graphics.PixelOffsetMode = PixelOffsetMode.Half;
+                    e.Graphics.DrawImage(_crop, new Rectangle(0, 0, CropSize * 2, CropSize * 2),
+                        new Rectangle(0, 0, CropSize, CropSize), GraphicsUnit.Pixel);
+                }
+                using var border = new Pen(Theme.Border, 1);
+                e.Graphics.DrawRectangle(border, 0, 0, Width - 1, Height - 1);
+            }
+            catch (Exception ex)
+            {
+                Log.Error("painting crop preview failed", ex);
+            }
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+                _crop?.Dispose();
+            base.Dispose(disposing);
+        }
+    }
+
+    private sealed class CropPreviewSurface : Panel
+    {
+        public CropPreviewSurface()
+        {
+            SetStyle(ControlStyles.UserPaint
+                     | ControlStyles.AllPaintingInWmPaint
+                     | ControlStyles.OptimizedDoubleBuffer
+                     | ControlStyles.ResizeRedraw, true);
+        }
+
+        protected override void OnPaintBackground(PaintEventArgs e)
+        {
+            e.Graphics.Clear(Parent?.BackColor ?? Theme.Bg);
+            var shadowBounds = new Rectangle(4, 4, Width - 5, Height - 5);
+            using (var shadow = new SolidBrush(Color.FromArgb(110, 0, 0, 0)))
+                e.Graphics.FillRectangle(shadow, shadowBounds);
+            var bounds = new Rectangle(0, 0, Width - 5, Height - 5);
+            using (var fill = new SolidBrush(Theme.Panel))
+                e.Graphics.FillRectangle(fill, bounds);
+            using var border = new Pen(Theme.Border, 1);
+            e.Graphics.DrawRectangle(border, bounds);
+        }
+    }
+
+    private sealed class ZoneCountRow : Control
+    {
+        private readonly string _name;
+        private readonly Font _labelFont = new("Segoe UI", 9f);
+        private readonly Font _countFont = new("Consolas", 8.25f);
+        private int _count;
+        private int _target;
+
+        public ZoneCountRow(string name, int count, int target)
+        {
+            _name = name;
+            _count = count;
+            _target = target;
+            BackColor = Theme.Panel;
+            ForeColor = Theme.Text;
+            SetStyle(ControlStyles.UserPaint
+                     | ControlStyles.AllPaintingInWmPaint
+                     | ControlStyles.OptimizedDoubleBuffer
+                     | ControlStyles.ResizeRedraw, true);
+        }
+
+        public void SetCount(int count, int target)
+        {
+            if (_count == count && _target == target) return;
+            _count = count;
+            _target = target;
+            Invalidate();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.Clear(BackColor);
+            var labelBounds = new Rectangle(0, 0, Math.Max(0, Width - 100), 28);
+            var countBounds = new Rectangle(Math.Max(0, Width - 100), 0, Math.Min(100, Width), 28);
+            TextRenderer.DrawText(e.Graphics, _name, _labelFont, labelBounds, Theme.Text,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+            TextRenderer.DrawText(e.Graphics, $"{_count} / {_target}", _countFont, countBounds, Theme.Text,
+                TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+
+            var track = new Rectangle(0, Height - 5, Width, 3);
+            using (var trackBrush = new SolidBrush(Theme.Border))
+                e.Graphics.FillRectangle(trackBrush, track);
+            float ratio = _target > 0 ? Math.Clamp(_count / (float)_target, 0f, 1f) : 0f;
+            int fillWidth = (int)Math.Round(track.Width * ratio);
+            if (fillWidth > 0)
+            {
+                using var fill = new SolidBrush(Theme.Accent);
+                e.Graphics.FillRectangle(fill, new Rectangle(track.X, track.Y, fillWidth, track.Height));
+            }
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                _labelFont.Dispose();
+                _countFont.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+    }
+
+    private sealed class ToggleRow : CheckBox
+    {
+        private bool _hovered;
+
+        public ToggleRow(string text)
+        {
+            Text = text;
+            Width = 246;
+            Height = 32;
+            AutoSize = false;
+            BackColor = Theme.Panel;
+            ForeColor = Theme.Text;
+            Font = new Font("Segoe UI", 9f);
+            Cursor = Cursors.Hand;
+            TabStop = true;
+            SetStyle(ControlStyles.UserPaint
+                     | ControlStyles.AllPaintingInWmPaint
+                     | ControlStyles.OptimizedDoubleBuffer
+                     | ControlStyles.ResizeRedraw
+                     | ControlStyles.Selectable, true);
+        }
+
+        protected override void OnMouseEnter(EventArgs e)
+        {
+            _hovered = true;
+            Invalidate();
+            base.OnMouseEnter(e);
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            _hovered = false;
+            Invalidate();
+            base.OnMouseLeave(e);
+        }
+
+        protected override void OnCheckedChanged(EventArgs e)
+        {
+            Invalidate();
+            base.OnCheckedChanged(e);
+        }
+
+        protected override void OnGotFocus(EventArgs e)
+        {
+            Invalidate();
+            base.OnGotFocus(e);
+        }
+
+        protected override void OnLostFocus(EventArgs e)
+        {
+            Invalidate();
+            base.OnLostFocus(e);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.Clear(Parent?.BackColor ?? Theme.Panel);
+            var bounds = new Rectangle(0, 0, Width - 1, Height - 1);
+            using var backgroundPath = RoundedButton.CreateRectanglePath(bounds);
+            using (var background = new SolidBrush(_hovered ? Theme.PanelHi : Theme.Panel))
+                e.Graphics.FillPath(background, backgroundPath);
+            using (var border = new Pen(Focused ? Theme.Text : Theme.Border, 1))
+                e.Graphics.DrawPath(border, backgroundPath);
+
+            var checkBounds = new Rectangle(8, 8, 16, 16);
+            using (var checkFill = new SolidBrush(Checked ? Theme.PanelHi : Theme.Bg))
+                e.Graphics.FillRectangle(checkFill, checkBounds);
+            using (var checkBorder = new Pen(Checked ? Theme.Text : Theme.Muted, 1))
+                e.Graphics.DrawRectangle(checkBorder, checkBounds);
+            if (Checked)
+            {
+                using var check = new Pen(Theme.Text, 2);
+                e.Graphics.DrawLine(check, 11, 16, 14, 19);
+                e.Graphics.DrawLine(check, 14, 19, 21, 12);
+            }
+            TextRenderer.DrawText(e.Graphics, Text, Font, new Rectangle(32, 0, Width - 40, Height),
+                Theme.Text, TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
+            if (Focused)
+                ControlPaint.DrawFocusRectangle(e.Graphics, new Rectangle(4, 4, Width - 9, Height - 9), Theme.Text, Theme.Panel);
+        }
+    }
+
     private sealed class ScreenPreview : Control
     {
         private ScreenPin? _hoveredPin;
+        private readonly HashSet<ScreenPin> _pinsTooClose = new();
         private RectangleF _imageRectangle;
         private Point _panStartMouse;
-        private PointF _panStartOffset;
-        private PointF _panOffset;
+        private Point _mousePosition;
+        private Point _aimPoint;
+        private PointF _panImageOffset;
+        private PointF _panStartImageOffset;
+        private MouseButtons _panButton;
         private float _zoom = 1f;
         private bool _isPanning;
-        private readonly Font _emptyTitleFont = new("Segoe UI Semibold", 13f, FontStyle.Bold);
-        private readonly Font _emptyBodyFont = new("Segoe UI", 9.5f);
-        private readonly Font _emptyHintFont = new("Consolas", 8f, FontStyle.Bold);
-        private readonly Font _dimensionFont = new("Consolas", 9f, FontStyle.Bold);
-        private readonly Font _instructionFont = new("Consolas", 8f, FontStyle.Bold);
-        private readonly Font _zoomFont = new("Consolas", 8f, FontStyle.Bold);
-        private readonly Font _pinLabelFont = new("Consolas", 8f, FontStyle.Bold);
+        private bool _panMoved;
+        private bool _suppressPanClick;
+        private bool _hasAimPoint;
+        private bool _hasMousePosition;
+        private readonly Font _emptyTitleFont = new("Segoe UI Semibold", 10f, FontStyle.Bold);
+        private readonly Font _emptyBodyFont = new("Segoe UI", 9f);
+        private readonly Font _emptyHintFont = new("Consolas", 8.25f);
+        private readonly Font _dimensionFont = new("Consolas", 8.25f);
+        private readonly Font _instructionFont = new("Consolas", 8.25f);
+        private readonly Font _zoomFont = new("Consolas", 8.25f);
+        private readonly Font _pinLabelFont = new("Consolas", 8.25f);
 
         public Bitmap? Frame { get; set; }
         public string CaptureShortcut { get; set; } = "Q";
         public List<ScreenPin> Pins { get; set; } = null!;
+        private int _minimumPinSpacing;
+        public int MinimumPinSpacing
+        {
+            get => _minimumPinSpacing;
+            set
+            {
+                if (_minimumPinSpacing == value) return;
+                _minimumPinSpacing = value;
+                RefreshPinSpacingWarnings();
+            }
+        }
+        public ScreenPin? SelectedPin { get; set; }
+        public ScreenPin? HoveredPin => _hoveredPin;
+        public bool IsPanning => _isPanning;
         public event Action<Point>? PinCreated;
         public event Action<ScreenPin>? PinDeleteRequested;
+        public event Action<ScreenPin?>? PreviewPinChanged;
 
         public void ResetView()
         {
             _zoom = 1f;
-            _panOffset = PointF.Empty;
+            _aimPoint = Frame is null
+                ? Point.Empty
+                : new Point(Frame.Width / 2, Frame.Height / 2);
+            _panImageOffset = PointF.Empty;
+            _hasAimPoint = Frame is not null;
+            _hasMousePosition = false;
             _hoveredPin = null;
             _isPanning = false;
+        }
+
+        public void RefreshPinSpacingWarnings()
+        {
+            _pinsTooClose.Clear();
+            if (MinimumPinSpacing <= 0 || Pins is null)
+            {
+                Invalidate();
+                return;
+            }
+
+            var cells = new Dictionary<(int X, int Y), List<ScreenPin>>();
+            long minimumDistanceSquared = (long)MinimumPinSpacing * MinimumPinSpacing;
+            foreach (ScreenPin pin in Pins)
+            {
+                int cellX = pin.X / MinimumPinSpacing;
+                int cellY = pin.Y / MinimumPinSpacing;
+                for (int offsetY = -1; offsetY <= 1; offsetY++)
+                for (int offsetX = -1; offsetX <= 1; offsetX++)
+                {
+                    if (!cells.TryGetValue((cellX + offsetX, cellY + offsetY), out List<ScreenPin>? candidates))
+                        continue;
+                    foreach (ScreenPin other in candidates)
+                    {
+                        long dx = (long)pin.X - other.X;
+                        long dy = (long)pin.Y - other.Y;
+                        if (dx * dx + dy * dy > minimumDistanceSquared)
+                            continue;
+                        _pinsTooClose.Add(pin);
+                        _pinsTooClose.Add(other);
+                    }
+                }
+
+                if (!cells.TryGetValue((cellX, cellY), out List<ScreenPin>? cell))
+                    cells[(cellX, cellY)] = cell = new List<ScreenPin>();
+                cell.Add(pin);
+            }
+            Invalidate();
         }
 
         public ScreenPreview()
@@ -1479,54 +2562,103 @@ public sealed class MainForm : Form
             if (ClientSize.Width <= 0 || ClientSize.Height <= 0) return;
             _imageRectangle = CalculateImageRectangle();
             float scale = _imageRectangle.Width / Frame.Width;
-            graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
-            graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            graphics.InterpolationMode = InterpolationMode.NearestNeighbor;
+            graphics.PixelOffsetMode = PixelOffsetMode.Half;
             graphics.DrawImage(Frame, _imageRectangle);
             using (var border = new Pen(Theme.Border, 1))
                 graphics.DrawRectangle(border, _imageRectangle.X, _imageRectangle.Y, _imageRectangle.Width, _imageRectangle.Height);
 
             foreach (ScreenPin pin in Pins)
-                DrawPin(graphics, pin, scale);
+                DrawPin(graphics, pin, scale, _imageRectangle);
 
             var dimensionText = $"{Frame.Width} × {Frame.Height}";
             TextRenderer.DrawText(graphics, dimensionText, _dimensionFont,
                 new Point(12, 10), Color.FromArgb(230, 255, 255, 255));
-            var instruction = "LEFT CLICK  PIN     RIGHT CLICK  DELETE     WHEEL  ZOOM     MIDDLE-DRAG  PAN";
+            var instruction = "LEFT CLICK  PIN     RIGHT CLICK  DELETE     RIGHT / MIDDLE DRAG  PAN     ESC  STOP PAN     WHEEL  ZOOM";
             TextRenderer.DrawText(graphics, instruction, _instructionFont,
                 new Rectangle(12, Height - 28, Width - 24, 18), Color.FromArgb(210, 255, 255, 255),
                 TextFormatFlags.Bottom | TextFormatFlags.Left);
+            DrawMagnifier(graphics, scale);
+            if (_zoom <= 1f)
+                DrawAimMarker(graphics);
             DrawZoomBadge(graphics);
         }
 
         private void DrawEmptyState(Graphics graphics)
         {
-            int cardWidth = Math.Min(420, ClientSize.Width - 48);
+            int cardWidth = Math.Min(380, ClientSize.Width - 48);
             int cardHeight = 178;
             if (cardWidth < 220 || ClientSize.Height < 100) return;
             var card = new Rectangle((ClientSize.Width - cardWidth) / 2,
                 (ClientSize.Height - cardHeight) / 2, cardWidth, cardHeight);
-            using var cardPath = RoundedButton.CreateRoundRectangle(card, 14);
-            using var fill = new LinearGradientBrush(card, Theme.PanelTop, Theme.Panel, 90f);
+            using var cardPath = RoundedButton.CreateRectanglePath(card);
+            using var fill = new SolidBrush(Theme.Panel);
             using var border = new Pen(Theme.BorderSoft);
             graphics.SmoothingMode = SmoothingMode.AntiAlias;
             graphics.FillPath(fill, cardPath);
             graphics.DrawPath(border, cardPath);
 
             var iconBounds = new Rectangle(card.X + 26, card.Y + 27, 38, 38);
-            using (var glow = new SolidBrush(Theme.AccentSoft))
-                graphics.FillEllipse(glow, iconBounds);
-            using (var dot = new SolidBrush(Theme.Accent))
-                graphics.FillEllipse(dot, iconBounds.X + 12, iconBounds.Y + 12, 14, 14);
+            DrawReadyIcon(graphics, iconBounds);
 
-            TextRenderer.DrawText(graphics, "READY TO LABEL", _emptyTitleFont,
+            TextRenderer.DrawText(graphics, "Ready to label", _emptyTitleFont,
                 new Rectangle(card.X + 76, card.Y + 29, card.Width - 100, 26),
                 Theme.Text, TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
-            TextRenderer.DrawText(graphics, "Capture the primary display to start pinning.",
+            TextRenderer.DrawText(graphics, "Capture an image, then place and label pins.",
                 _emptyBodyFont, new Rectangle(card.X + 28, card.Y + 88, card.Width - 56, 22),
-                Theme.Muted, TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
-            TextRenderer.DrawText(graphics, $"{CaptureShortcut} CAPTURE     ·     WHEEL ZOOM     ·     MIDDLE-DRAG PAN",
-                _emptyHintFont, new Rectangle(card.X + 28, card.Y + 126, card.Width - 56, 20),
-                Theme.Accent, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+                Theme.Muted, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+
+            var hintBounds = new Rectangle(card.X + 20, card.Y + 128, card.Width - 40, 24);
+            int captureWidth = GetHintChipWidth(CaptureShortcut, "Capture");
+            int zoomWidth = GetHintChipWidth("Wheel", "Zoom");
+            int panWidth = GetHintChipWidth("Right", "Pan");
+            int totalWidth = captureWidth + zoomWidth + panWidth + 16;
+            if (totalWidth <= hintBounds.Width)
+            {
+                int x = hintBounds.X + (hintBounds.Width - totalWidth) / 2;
+                DrawHintChip(graphics, hintBounds.Y, x, CaptureShortcut, "Capture");
+                DrawHintChip(graphics, hintBounds.Y, x + captureWidth + 8, "Wheel", "Zoom");
+                DrawHintChip(graphics, hintBounds.Y, x + captureWidth + zoomWidth + 16, "Right", "Pan");
+            }
+            else
+            {
+                DrawHintChip(graphics, hintBounds.Y - 4,
+                    hintBounds.X + (hintBounds.Width - captureWidth) / 2, CaptureShortcut, "Capture");
+                int secondaryWidth = zoomWidth + panWidth + 8;
+                int x = hintBounds.X + (hintBounds.Width - secondaryWidth) / 2;
+                DrawHintChip(graphics, hintBounds.Y + 20, x, "Wheel", "Zoom");
+                DrawHintChip(graphics, hintBounds.Y + 20, x + zoomWidth + 8, "Right", "Pan");
+            }
+        }
+
+        private void DrawReadyIcon(Graphics graphics, Rectangle bounds)
+        {
+            graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            using var pen = new Pen(Theme.Muted, 1.5f) { StartCap = LineCap.Round, EndCap = LineCap.Round };
+            graphics.DrawRectangle(pen, bounds.X + 8, bounds.Y + 8, 22, 18);
+            graphics.DrawLine(pen, bounds.X + 11, bounds.Y + 6, bounds.X + 18, bounds.Y + 6);
+            graphics.DrawEllipse(pen, bounds.X + 14, bounds.Y + 12, 10, 10);
+            graphics.DrawLine(pen, bounds.X + 25, bounds.Y + 12, bounds.X + 28, bounds.Y + 10);
+        }
+
+        private int GetHintChipWidth(string key, string label) =>
+            TextRenderer.MeasureText(key, _emptyHintFont).Width + 16
+            + 6 + TextRenderer.MeasureText(label, _emptyBodyFont).Width;
+
+        private void DrawHintChip(Graphics graphics, int y, int x, string key, string label)
+        {
+            int keyWidth = TextRenderer.MeasureText(key, _emptyHintFont).Width + 16;
+            int labelWidth = TextRenderer.MeasureText(label, _emptyBodyFont).Width;
+            var keyBounds = new Rectangle(x, y + 1, keyWidth, 22);
+            using (var fill = new SolidBrush(Theme.Bg))
+                graphics.FillRectangle(fill, keyBounds);
+            using (var border = new Pen(Theme.Border))
+                graphics.DrawRectangle(border, keyBounds);
+            TextRenderer.DrawText(graphics, key, _emptyHintFont, keyBounds, Theme.Text,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+            var labelBounds = new Rectangle(keyBounds.Right + 6, y, labelWidth + 1, 24);
+            TextRenderer.DrawText(graphics, label, _emptyBodyFont, labelBounds, Theme.Muted,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
         }
 
         private void DrawZoomBadge(Graphics graphics)
@@ -1534,7 +2666,7 @@ public sealed class MainForm : Form
             string text = $"{_zoom * 100:0}%";
             Size textSize = TextRenderer.MeasureText(text, _zoomFont);
             var bounds = new Rectangle(Width - textSize.Width - 38, 10, textSize.Width + 24, 24);
-            using var path = RoundedButton.CreateRoundRectangle(bounds, 7);
+            using var path = RoundedButton.CreateRectanglePath(bounds);
             using var background = new SolidBrush(Color.FromArgb(225, 15, 20, 32));
             using var border = new Pen(Theme.Border);
             graphics.SmoothingMode = SmoothingMode.AntiAlias;
@@ -1544,17 +2676,88 @@ public sealed class MainForm : Form
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
         }
 
-        private void DrawPin(Graphics graphics, ScreenPin pin, float scale)
+        private void DrawAimMarker(Graphics graphics)
         {
-            float x = _imageRectangle.Left + (pin.X + 0.5f) * scale;
-            float y = _imageRectangle.Top + (pin.Y + 0.5f) * scale;
+            if (!_hasMousePosition || !_imageRectangle.Contains(_mousePosition))
+                return;
+            PointF marker = _mousePosition;
+
+            graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            using var outline = new Pen(Color.FromArgb(230, 0, 0, 0), 3f);
+            using var line = new Pen(Color.White, 1.4f);
+            graphics.DrawEllipse(outline, marker.X - 9, marker.Y - 9, 18, 18);
+            graphics.DrawLine(outline, marker.X - 13, marker.Y, marker.X + 13, marker.Y);
+            graphics.DrawLine(outline, marker.X, marker.Y - 13, marker.X, marker.Y + 13);
+            graphics.DrawEllipse(line, marker.X - 9, marker.Y - 9, 18, 18);
+            graphics.DrawLine(line, marker.X - 13, marker.Y, marker.X + 13, marker.Y);
+            graphics.DrawLine(line, marker.X, marker.Y - 13, marker.X, marker.Y + 13);
+            using var center = new SolidBrush(Theme.Bg);
+            graphics.FillEllipse(center, marker.X - 2, marker.Y - 2, 4, 4);
+        }
+
+        private void DrawMagnifier(Graphics graphics, float fitScale)
+        {
+            if (_zoom <= 1f || Frame is null || !_hasMousePosition || !_imageRectangle.Contains(_mousePosition))
+                return;
+
+            const int diameter = 224;
+            var lensBounds = new Rectangle(
+                _mousePosition.X - diameter / 2,
+                _mousePosition.Y - diameter / 2,
+                diameter,
+                diameter);
+            float zoomScale = fitScale * _zoom;
+            var zoomedImage = new RectangleF(
+                _mousePosition.X - (_aimPoint.X + 0.5f) * zoomScale,
+                _mousePosition.Y - (_aimPoint.Y + 0.5f) * zoomScale,
+                Frame.Width * zoomScale,
+                Frame.Height * zoomScale);
+            using var lensPath = new GraphicsPath();
+            lensPath.AddEllipse(lensBounds);
+            GraphicsState state = graphics.Save();
+            graphics.SetClip(lensPath, CombineMode.Intersect);
+            graphics.FillEllipse(Brushes.Black, lensBounds);
+            graphics.InterpolationMode = InterpolationMode.NearestNeighbor;
+            graphics.PixelOffsetMode = PixelOffsetMode.Half;
+            graphics.DrawImage(Frame, zoomedImage);
+            foreach (ScreenPin pin in Pins)
+                DrawPin(graphics, pin, zoomScale, zoomedImage);
+            graphics.Restore(state);
+
+            graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            using (var shadow = new Pen(Color.FromArgb(190, 0, 0, 0), 5f))
+                graphics.DrawEllipse(shadow, lensBounds);
+            using (var border = new Pen(Theme.Text, 2f))
+                graphics.DrawEllipse(border, lensBounds);
+            using (var reticle = new Pen(Color.FromArgb(220, 255, 255, 255), 1f))
+            {
+                graphics.DrawLine(reticle, _mousePosition.X - 9, _mousePosition.Y,
+                    _mousePosition.X + 9, _mousePosition.Y);
+                graphics.DrawLine(reticle, _mousePosition.X, _mousePosition.Y - 9,
+                    _mousePosition.X, _mousePosition.Y + 9);
+            }
+            using var center = new SolidBrush(Theme.Accent);
+            graphics.FillEllipse(center, _mousePosition.X - 2, _mousePosition.Y - 2, 4, 4);
+        }
+
+        private void DrawPin(Graphics graphics, ScreenPin pin, float scale, RectangleF imageRectangle)
+        {
+            float x = imageRectangle.Left + (pin.X + 0.5f) * scale;
+            float y = imageRectangle.Top + (pin.Y + 0.5f) * scale;
             float radius = Math.Max(5f, Math.Min(10f, 8f / Math.Max(scale, 0.15f)));
             bool hovered = ReferenceEquals(pin, _hoveredPin);
-            Color color = pin.Confirming ? Theme.Success : Theme.Accent;
+            Color color = pin.Confirming ? Theme.Success : Theme.Text;
             graphics.SmoothingMode = SmoothingMode.AntiAlias;
             using (var glow = new SolidBrush(Color.FromArgb(hovered ? 100 : 55, color)))
                 graphics.FillEllipse(glow, x - radius * 2.2f, y - radius * 2.2f, radius * 4.4f, radius * 4.4f);
-            using (var fill = new SolidBrush(hovered ? Color.FromArgb(155, 150, 255) : color))
+            if (_pinsTooClose.Contains(pin))
+            {
+                using var warningRing = new Pen(Theme.Warn, 1.5f) { DashStyle = DashStyle.Dash };
+                float ringRadius = radius + 8;
+                graphics.DrawEllipse(warningRing, x - ringRadius, y - ringRadius,
+                    ringRadius * 2, ringRadius * 2);
+            }
+            using (var fill = new SolidBrush(color))
                 graphics.FillEllipse(fill, x - radius, y - radius, radius * 2, radius * 2);
             using (var outline = new Pen(Color.FromArgb(230, 255, 255, 255), 1.2f))
                 graphics.DrawEllipse(outline, x - radius, y - radius, radius * 2, radius * 2);
@@ -1574,11 +2777,14 @@ public sealed class MainForm : Form
             base.OnMouseDown(e);
             Focus();
             if (Frame is null) return;
-            if (e.Button == MouseButtons.Middle && _zoom > 1f)
+            if ((e.Button == MouseButtons.Middle || e.Button == MouseButtons.Right) && _zoom > 1f)
             {
                 _isPanning = true;
+                _panButton = e.Button;
+                _panMoved = false;
+                _suppressPanClick = false;
                 _panStartMouse = e.Location;
-                _panStartOffset = _panOffset;
+                _panStartImageOffset = _panImageOffset;
                 Capture = true;
                 Cursor = Cursors.SizeAll;
                 return;
@@ -1586,52 +2792,147 @@ public sealed class MainForm : Form
             if (e.Button == MouseButtons.Left && TryMapPoint(e.Location, out Point point))
             {
                 PinCreated?.Invoke(point);
+                _hoveredPin = FindPin(e.Location);
+                PreviewPinChanged?.Invoke(_hoveredPin);
                 return;
-            }
-            if (e.Button == MouseButtons.Right)
-            {
-                ScreenPin? pin = FindPin(e.Location);
-                if (pin is not null) PinDeleteRequested?.Invoke(pin);
             }
         }
 
         protected override void OnMouseEnter(EventArgs e)
         {
             base.OnMouseEnter(e);
+            _mousePosition = PointToClient(Cursor.Position);
+            _hasMousePosition = true;
+            if (_zoom > 1f)
+                UpdateAimPointFromPointer(_mousePosition);
             Focus();
+            Invalidate();
         }
 
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);
+            Point previousMousePosition = _mousePosition;
+            bool hadPreviousMousePosition = _hasMousePosition;
+            _mousePosition = e.Location;
+            _hasMousePosition = true;
             if (_isPanning)
             {
-                _panOffset = new PointF(
-                    _panStartOffset.X + e.X - _panStartMouse.X,
-                    _panStartOffset.Y + e.Y - _panStartMouse.Y);
+                if (Math.Abs(e.X - _panStartMouse.X) > 2 || Math.Abs(e.Y - _panStartMouse.Y) > 2)
+                    _panMoved = true;
+                float scale = GetFitScale() * _zoom;
+                _panImageOffset = new PointF(
+                    _panStartImageOffset.X - (e.X - _panStartMouse.X) / scale,
+                    _panStartImageOffset.Y - (e.Y - _panStartMouse.Y) / scale);
+                UpdateAimPointFromPointer(e.Location);
+                ScreenPin? hoveredDuringPan = FindPin(e.Location);
+                if (!ReferenceEquals(_hoveredPin, hoveredDuringPan))
+                {
+                    _hoveredPin = hoveredDuringPan;
+                    PreviewPinChanged?.Invoke(hoveredDuringPan);
+                }
                 Invalidate();
                 return;
             }
+
+            if (Frame is not null && _zoom > 1f && _imageRectangle.Contains(e.Location))
+                UpdateAimPointFromPointer(e.Location);
             ScreenPin? hovered = FindPin(e.Location);
-            if (!ReferenceEquals(_hoveredPin, hovered))
+            bool hoveredPinChanged = !ReferenceEquals(_hoveredPin, hovered);
+            if (hoveredPinChanged)
             {
                 _hoveredPin = hovered;
+                PreviewPinChanged?.Invoke(hovered);
+            }
+            if (hoveredPinChanged || _zoom > 1f)
+            {
                 Invalidate();
+            }
+            else
+            {
+                if (hadPreviousMousePosition && _imageRectangle.Contains(previousMousePosition))
+                    InvalidateAimMarker(previousMousePosition);
+                if (_imageRectangle.Contains(e.Location))
+                    InvalidateAimMarker(e.Location);
             }
             Cursor = Frame is not null && _imageRectangle.Contains(e.Location)
                 ? hovered is not null ? Cursors.Hand : Cursors.Cross
                 : Cursors.Default;
         }
 
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            Point previousMousePosition = _mousePosition;
+            bool hadPreviousMousePosition = _hasMousePosition;
+            bool hadHoveredPin = _hoveredPin is not null;
+            if (hadHoveredPin)
+            {
+                _hoveredPin = null;
+                PreviewPinChanged?.Invoke(null);
+            }
+            if (_isPanning) return;
+            _hasMousePosition = false;
+            if (_zoom > 1f || hadHoveredPin)
+                Invalidate();
+            else if (hadPreviousMousePosition && _imageRectangle.Contains(previousMousePosition))
+                InvalidateAimMarker(previousMousePosition);
+            Cursor = Cursors.Default;
+        }
+
+        public void ClearHoveredPin(ScreenPin pin)
+        {
+            if (!ReferenceEquals(_hoveredPin, pin)) return;
+            _hoveredPin = null;
+            PreviewPinChanged?.Invoke(null);
+        }
+
         protected override void OnMouseUp(MouseEventArgs e)
         {
             base.OnMouseUp(e);
-            if (e.Button == MouseButtons.Middle)
+            bool endingPan = _isPanning && e.Button == _panButton;
+            if (e.Button == MouseButtons.Right
+                && !_suppressPanClick
+                && (!endingPan || !_panMoved)
+                && ClientRectangle.Contains(e.Location))
+            {
+                ScreenPin? pin = FindPin(e.Location);
+                if (pin is not null) PinDeleteRequested?.Invoke(pin);
+            }
+            if (endingPan)
             {
                 _isPanning = false;
+                _panButton = MouseButtons.None;
+                _suppressPanClick = false;
                 Capture = false;
-                Cursor = Cursors.Default;
+                Cursor = _imageRectangle.Contains(e.Location) ? Cursors.Cross : Cursors.Default;
             }
+            else if (e.Button == MouseButtons.Right)
+                _suppressPanClick = false;
+        }
+
+        public bool CancelPan()
+        {
+            if (!_isPanning) return false;
+            _isPanning = false;
+            _suppressPanClick = true;
+            _panButton = MouseButtons.None;
+            if (Capture)
+                Capture = false;
+            Cursor = _imageRectangle.Contains(_mousePosition) ? Cursors.Cross : Cursors.Default;
+            Invalidate();
+            return true;
+        }
+
+        protected override void OnMouseCaptureChanged(EventArgs e)
+        {
+            base.OnMouseCaptureChanged(e);
+            if (Capture || !_isPanning) return;
+            _isPanning = false;
+            _suppressPanClick = true;
+            _panButton = MouseButtons.None;
+            Cursor = _imageRectangle.Contains(_mousePosition) ? Cursors.Cross : Cursors.Default;
+            Invalidate();
         }
 
         protected override void OnMouseWheel(MouseEventArgs e)
@@ -1639,22 +2940,13 @@ public sealed class MainForm : Form
             base.OnMouseWheel(e);
             if (Frame is null || !_imageRectangle.Contains(e.Location)) return;
 
-            float oldScale = _imageRectangle.Width / Frame.Width;
-            float imageX = (e.X - _imageRectangle.Left) / oldScale;
-            float imageY = (e.Y - _imageRectangle.Top) / oldScale;
+            UpdateAimPointFromPointer(e.Location);
+            _hasAimPoint = true;
             _zoom = Math.Clamp(_zoom * (e.Delta > 0 ? 1.2f : 1f / 1.2f), 1f, 16f);
-            if (_zoom <= 1f)
-            {
-                _panOffset = PointF.Empty;
-            }
-            else
-            {
-                float newScale = GetFitScale() * _zoom;
-                _panOffset = new PointF(
-                    e.X - (ClientSize.Width - Frame.Width * newScale) / 2f - imageX * newScale,
-                    e.Y - (ClientSize.Height - Frame.Height * newScale) / 2f - imageY * newScale);
-            }
-            _imageRectangle = CalculateImageRectangle();
+            _mousePosition = e.Location;
+            _hasMousePosition = true;
+            _hoveredPin = FindPin(e.Location);
+            PreviewPinChanged?.Invoke(_hoveredPin);
             Invalidate();
         }
 
@@ -1662,6 +2954,11 @@ public sealed class MainForm : Form
         {
             point = Point.Empty;
             if (Frame is null || !_imageRectangle.Contains(clientPoint)) return false;
+            if (_zoom > 1f && _hasAimPoint)
+            {
+                point = _aimPoint;
+                return true;
+            }
             float xScale = Frame.Width / _imageRectangle.Width;
             float yScale = Frame.Height / _imageRectangle.Height;
             point = new Point(
@@ -1675,11 +2972,15 @@ public sealed class MainForm : Form
             if (Frame is null || _imageRectangle.Width <= 0) return null;
             float scaleX = _imageRectangle.Width / Frame.Width;
             float scaleY = _imageRectangle.Height / Frame.Height;
+            PointF marker = _zoom > 1f && _hasAimPoint
+                ? new PointF(_imageRectangle.Left + (_aimPoint.X + 0.5f) * scaleX,
+                    _imageRectangle.Top + (_aimPoint.Y + 0.5f) * scaleY)
+                : clientPoint;
             ScreenPin? closest = null;
             float closestDistance = 18 * 18;
             foreach (ScreenPin pin in Pins)
             {
-                float distance = DistanceSquared(clientPoint,
+                float distance = DistanceSquared(Point.Round(marker),
                     new PointF(_imageRectangle.Left + (pin.X + 0.5f) * scaleX,
                         _imageRectangle.Top + (pin.Y + 0.5f) * scaleY));
                 if (distance > closestDistance) continue;
@@ -1698,14 +2999,39 @@ public sealed class MainForm : Form
         private RectangleF CalculateImageRectangle()
         {
             if (Frame is null) return RectangleF.Empty;
-            float scale = GetFitScale() * _zoom;
+            float scale = GetFitScale();
             float width = Frame.Width * scale;
             float height = Frame.Height * scale;
             return new RectangleF(
-                (ClientSize.Width - width) / 2f + _panOffset.X,
-                (ClientSize.Height - height) / 2f + _panOffset.Y,
+                (ClientSize.Width - width) / 2f,
+                (ClientSize.Height - height) / 2f,
                 width,
                 height);
+        }
+
+        private void UpdateAimPointFromPointer(Point pointer)
+        {
+            if (Frame is null || _imageRectangle.Width <= 0 || _imageRectangle.Height <= 0) return;
+            float scaleX = Frame.Width / _imageRectangle.Width;
+            float scaleY = Frame.Height / _imageRectangle.Height;
+            _aimPoint = new Point(
+                Math.Clamp((int)Math.Round((pointer.X - _imageRectangle.Left) * scaleX + _panImageOffset.X), 0, Frame.Width - 1),
+                Math.Clamp((int)Math.Round((pointer.Y - _imageRectangle.Top) * scaleY + _panImageOffset.Y), 0, Frame.Height - 1));
+            _hasAimPoint = true;
+        }
+
+        private void InvalidateAimMarker(Point position)
+        {
+            var bounds = new Rectangle(position.X - 15, position.Y - 15, 30, 30);
+            bounds.Intersect(ClientRectangle);
+            if (!bounds.IsEmpty)
+                Invalidate(bounds);
+        }
+
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+            _imageRectangle = CalculateImageRectangle();
         }
 
         private static float DistanceSquared(Point point, PointF target)
@@ -1741,13 +3067,78 @@ internal sealed class ScreenPin(int x, int y)
     public bool Exported { get; set; }
 }
 
+internal enum RoundedButtonIcon
+{
+    None,
+    Folder,
+    Refresh,
+}
+
 internal sealed class RoundedButton : Button
 {
     private bool _hovered;
     private bool _pressed;
+    private bool _focused;
+    private bool _accent;
+    private bool _quiet;
+    private bool _selected;
+    private string? _keyChipText;
+    private RoundedButtonIcon _icon;
 
-    public bool Accent { get; set; }
-    public bool Quiet { get; set; }
+    public bool Accent
+    {
+        get => _accent;
+        set
+        {
+            if (_accent == value) return;
+            _accent = value;
+            Invalidate();
+        }
+    }
+
+    public bool Quiet
+    {
+        get => _quiet;
+        set
+        {
+            if (_quiet == value) return;
+            _quiet = value;
+            Invalidate();
+        }
+    }
+
+    public bool Selected
+    {
+        get => _selected;
+        set
+        {
+            if (_selected == value) return;
+            _selected = value;
+            Invalidate();
+        }
+    }
+
+    public string? KeyChipText
+    {
+        get => _keyChipText;
+        set
+        {
+            if (_keyChipText == value) return;
+            _keyChipText = value;
+            Invalidate();
+        }
+    }
+
+    public RoundedButtonIcon Icon
+    {
+        get => _icon;
+        set
+        {
+            if (_icon == value) return;
+            _icon = value;
+            Invalidate();
+        }
+    }
 
     public RoundedButton()
     {
@@ -1755,9 +3146,9 @@ internal sealed class RoundedButton : Button
         FlatAppearance.BorderSize = 0;
         BackColor = Theme.Panel;
         ForeColor = Theme.Text;
-        Font = new Font("Segoe UI", 9f, FontStyle.Bold);
+        Font = new Font("Segoe UI", 9f);
         Cursor = Cursors.Hand;
-        TabStop = false;
+        TabStop = true;
         SetStyle(ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
     }
 
@@ -1790,8 +3181,23 @@ internal sealed class RoundedButton : Button
         base.OnMouseUp(e);
     }
 
+    protected override void OnGotFocus(EventArgs e)
+    {
+        _focused = true;
+        Invalidate();
+        base.OnGotFocus(e);
+    }
+
+    protected override void OnLostFocus(EventArgs e)
+    {
+        _focused = false;
+        Invalidate();
+        base.OnLostFocus(e);
+    }
+
     protected override void OnPaint(PaintEventArgs e)
     {
+        if (Width < 2 || Height < 2) return;
         Graphics graphics = e.Graphics;
         graphics.SmoothingMode = SmoothingMode.AntiAlias;
         Color parentColor = Theme.Bg;
@@ -1804,43 +3210,105 @@ internal sealed class RoundedButton : Button
             }
         }
         graphics.Clear(parentColor);
-        var bounds = new Rectangle(1, 1, Width - 3, Height - 3);
+        var bounds = new Rectangle(0, 0, Math.Max(0, Width - 1), Math.Max(0, Height - 1));
         Color fill = !Enabled
-            ? Theme.BgDeep
-            : _pressed ? Theme.PanelHi
-            : Accent ? Theme.AccentSoft
-            : _hovered ? Theme.PanelHi : Quiet ? Theme.BgDeep : Theme.Panel;
-        Color edge = Accent ? Theme.Accent : _hovered ? Theme.Accent : Quiet ? Theme.BorderSoft : Theme.Border;
+            ? Theme.Panel
+            : Accent
+                ? _pressed ? ControlPaint.Dark(Theme.Accent, 0.12f)
+                    : _hovered ? ControlPaint.Light(Theme.Accent, 0.12f)
+                    : Theme.Accent
+                : _pressed || _hovered ? Theme.PanelHi
+                : Selected ? Theme.PanelHi
+                : parentColor;
+        bool drawBorder = !Quiet || Selected || _focused;
+        Color edge = _focused
+            ? Accent ? ControlPaint.Light(Theme.Accent, 0.3f) : Theme.Muted
+            : Selected ? Theme.Muted : Theme.Border;
 
-        if (Enabled && (_hovered || Accent))
+        using (var path = CreateRectanglePath(bounds))
         {
-            using var glow = new Pen(Color.FromArgb(Accent ? 42 : 62, Theme.Accent), 3);
-            using var glowPath = CreateRoundRectangle(bounds, 9);
-            graphics.DrawPath(glow, glowPath);
-        }
-        using (var path = CreateRoundRectangle(bounds, 9))
-        using (var brush = new LinearGradientBrush(bounds, fill, Color.FromArgb(
-                   Math.Min(255, fill.R + 8), Math.Min(255, fill.G + 8), Math.Min(255, fill.B + 12)), 90f))
-        using (var pen = new Pen(edge, 1))
-        {
+            using var brush = new SolidBrush(fill);
             graphics.FillPath(brush, path);
-            graphics.DrawPath(pen, path);
+            if (drawBorder)
+            {
+                using var pen = new Pen(edge, 1);
+                graphics.DrawPath(pen, path);
+            }
         }
 
-        Color textColor = !Enabled ? Theme.Muted : Accent ? Color.White : ForeColor;
-        TextRenderer.DrawText(graphics, Text, Font, bounds, textColor,
-            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+        Color textColor = !Enabled ? Theme.Muted : Accent ? Color.White : Quiet ? Theme.Muted : ForeColor;
+        if (!string.IsNullOrEmpty(KeyChipText))
+        {
+            var chipBounds = new Rectangle(12, Math.Max(0, (Height - 18) / 2), 18, 18);
+            using (var chipFill = new SolidBrush(Theme.Bg))
+                graphics.FillRectangle(chipFill, chipBounds);
+            using (var chipBorder = new Pen(Theme.Border, 1))
+                graphics.DrawRectangle(chipBorder, chipBounds);
+            using var chipFont = new Font("Consolas", KeyChipText.Length > 3 ? 5.5f : 7f);
+            TextRenderer.DrawText(graphics, KeyChipText, chipFont, chipBounds, Theme.Text,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+            var labelBounds = new Rectangle(chipBounds.Right + 8, 0,
+                Math.Max(0, Width - chipBounds.Right - 20), Height);
+            TextRenderer.DrawText(graphics, Text, Font, labelBounds, textColor,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+        }
+        else
+        {
+            if (Icon != RoundedButtonIcon.None)
+            {
+                DrawVectorIcon(graphics, Icon, new Rectangle((Width - 16) / 2, (Height - 16) / 2, 16, 16),
+                    !Enabled ? Theme.Muted : _hovered || _focused ? Theme.Text : ForeColor);
+            }
+            var textBounds = new Rectangle(12, 0, Math.Max(0, Width - 24), Height);
+            TextRenderer.DrawText(graphics, Text, Font, textBounds, textColor,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter
+                | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+        }
+
+        if (_focused)
+        {
+            using var focusPen = new Pen(edge, 1);
+            using var focusPath = CreateRectanglePath(
+                new Rectangle(0, 0, Math.Max(0, Width - 1), Math.Max(0, Height - 1)));
+            graphics.DrawPath(focusPen, focusPath);
+        }
     }
 
-    internal static GraphicsPath CreateRoundRectangle(Rectangle bounds, int radius)
+    private static void DrawVectorIcon(Graphics graphics, RoundedButtonIcon icon, Rectangle bounds, Color color)
     {
-        int diameter = Math.Max(1, radius * 2);
+        graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        using var pen = new Pen(color, 1.5f) { StartCap = LineCap.Round, EndCap = LineCap.Round };
+        if (icon == RoundedButtonIcon.Folder)
+        {
+            using var path = new GraphicsPath();
+            path.AddLines(new[]
+            {
+                new Point(bounds.Left + 1, bounds.Top + 4),
+                new Point(bounds.Left + 6, bounds.Top + 4),
+                new Point(bounds.Left + 8, bounds.Top + 6),
+                new Point(bounds.Right - 1, bounds.Top + 6),
+                new Point(bounds.Right - 2, bounds.Bottom - 2),
+                new Point(bounds.Left + 2, bounds.Bottom - 2),
+                new Point(bounds.Left + 1, bounds.Top + 4),
+            });
+            graphics.DrawPath(pen, path);
+        }
+        else if (icon == RoundedButtonIcon.Refresh)
+        {
+            graphics.DrawArc(pen, bounds.Left + 2, bounds.Top + 2, 12, 12, 205, 275);
+            graphics.DrawLines(pen, new[]
+            {
+                new Point(bounds.Left + 1, bounds.Top + 3),
+                new Point(bounds.Left + 1, bounds.Top + 7),
+                new Point(bounds.Left + 5, bounds.Top + 7),
+            });
+        }
+    }
+
+    internal static GraphicsPath CreateRectanglePath(Rectangle bounds)
+    {
         var path = new GraphicsPath();
-        path.AddArc(bounds.X, bounds.Y, diameter, diameter, 180, 90);
-        path.AddArc(bounds.Right - diameter, bounds.Y, diameter, diameter, 270, 90);
-        path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
-        path.AddArc(bounds.X, bounds.Bottom - diameter, diameter, diameter, 90, 90);
-        path.CloseFigure();
+        path.AddRectangle(bounds);
         return path;
     }
 }
