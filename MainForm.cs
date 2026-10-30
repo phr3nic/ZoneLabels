@@ -55,16 +55,20 @@ public sealed class MainForm : Form
     private const int ZoneHotkeyBase = 10;
     private const int PinConfirmationMs = 550;
     private const int CropSize = 96;
+    private const int ExpandedSidebarWidth = 272;
+    private const int CollapsedSidebarWidth = 56;
+    private const int SidebarCollapseBreakpoint = 1280;
+    private static readonly Font ZoneButtonFont = new("Segoe UI Semibold", 9f, FontStyle.Bold);
+    private static readonly Font ZoneCountFont = new("Consolas", 8.25f);
 
     private readonly string _configPath = Path.Combine(AppContext.BaseDirectory, "config.json");
     private readonly string _imageDirectory = Path.Combine(Log.Directory, "data");
     private readonly string _todoDirectory = Path.Combine(Log.Directory, "todo");
     private readonly string _doneDirectory = Path.Combine(Log.Directory, "done");
-    private readonly string _legacyGalleryDirectory = Path.Combine(Log.Directory, "gallery");
     private readonly string _csvPath = Path.Combine(Log.Directory, "labels.csv");
+    private readonly DatasetManifestStore _manifestStore = new(Log.Directory);
     private readonly Dictionary<string, int> _counts = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, ZoneCountRow> _countLabels = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, Label> _countStripLabels = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, RoundedButton> _zoneButtons = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<int> _registeredHotkeys = new();
     private readonly HashSet<Control> _dropEnabledControls = new();
@@ -74,9 +78,9 @@ public sealed class MainForm : Form
     private readonly ScreenPreview _preview;
     private readonly CropPreview _cropPreview;
     private CropPreviewSurface? _cropPreviewSurface;
-    private readonly FlowLayoutPanel _zoneButtonsPanel;
+    private readonly HorizontalFlowLayoutPanel _zoneButtonsPanel;
+    private readonly HorizontalFlowLayoutPanel _shortcutPanel;
     private readonly FlowLayoutPanel _countList;
-    private readonly FlowLayoutPanel _datasetCountStrip;
     private readonly Label _statusLabel;
     private readonly Label _statusIcon;
     private readonly Label _hotkeyIndicator;
@@ -88,6 +92,20 @@ public sealed class MainForm : Form
     private readonly ToolTip _windowToolTip;
     private readonly ToggleRow _alwaysOnTopCheck;
     private readonly ToggleRow _hideWhileCapturingCheck;
+    private GlassPanel? _sidebarSurface;
+    private TableLayoutPanel? _workspaceLayout;
+    private TableLayoutPanel? _sidebarLayout;
+    private Label? _sidebarCaption;
+    private GlassPanel? _countsFrame;
+    private FlowLayoutPanel? _utilityActions;
+    private FlowLayoutPanel? _mainActions;
+    private FlowLayoutPanel? _toggles;
+    private TableLayoutPanel? _sidebarFooter;
+    private RoundedButton? _openFolderButton;
+    private RoundedButton? _refreshCountsButton;
+    private RoundedButton? _settingsButton;
+    private RoundedButton? _galleryButton;
+    private RoundedButton? _sidebarToggleButton;
     private readonly System.Windows.Forms.Timer _pinFlashTimer;
     private readonly System.Windows.Forms.Timer _discardClickTimer;
     private readonly System.Windows.Forms.Timer _boundsSaveTimer;
@@ -104,6 +122,8 @@ public sealed class MainForm : Form
     private bool _timerResolutionAcquired;
     private bool _hotkeyRegistrationFailed;
     private bool _isFullScreen;
+    private bool _sidebarCollapsed;
+    private int _lastResponsiveWidth;
     private Rectangle _restoreBounds;
 
     public MainForm()
@@ -116,6 +136,7 @@ public sealed class MainForm : Form
         Directory.CreateDirectory(Log.Directory);
         Directory.CreateDirectory(_imageDirectory);
         Directory.CreateDirectory(_todoDirectory);
+        _manifestStore.LoadOrMigrate();
         try
         {
             _config = AppConfig.Load(_configPath);
@@ -170,14 +191,24 @@ public sealed class MainForm : Form
         _preview.PrecisionStateChanged += UpdatePrecisionStatus;
         _cropPreview = new CropPreview();
 
-        _zoneButtonsPanel = new FlowLayoutPanel
+        _zoneButtonsPanel = new HorizontalFlowLayoutPanel
         {
             Dock = DockStyle.Fill,
             WrapContents = true,
             FlowDirection = FlowDirection.LeftToRight,
             Margin = new Padding(0),
-            Padding = Padding.Empty,
+            Padding = new Padding(0, 8, 0, 8),
             BackColor = Color.Transparent,
+        };
+        _shortcutPanel = new HorizontalFlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            AutoScroll = true,
+            Margin = Padding.Empty,
+            Padding = new Padding(16, 0, 16, 0),
+            BackColor = Theme.Bg,
         };
         _countList = new FlowLayoutPanel
         {
@@ -190,23 +221,13 @@ public sealed class MainForm : Form
             BackColor = Theme.Panel,
         };
         _countList.SizeChanged += (_, _) => UpdateCountRowWidths();
-        _datasetCountStrip = new FlowLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            FlowDirection = FlowDirection.LeftToRight,
-            WrapContents = false,
-            AutoScroll = true,
-            Margin = Padding.Empty,
-            Padding = new Padding(16, 8, 16, 8),
-            BackColor = Color.Transparent,
-        };
         _statusLabel = new Label
         {
             Dock = DockStyle.Fill,
             AutoEllipsis = true,
             TextAlign = ContentAlignment.MiddleLeft,
             ForeColor = Theme.Text,
-            Font = new Font("Segoe UI", 9f),
+            Font = new Font("Segoe UI", 8.25f),
             Margin = new Padding(8, 0, 0, 0),
         };
         _statusIcon = new Label
@@ -232,15 +253,14 @@ public sealed class MainForm : Form
             AccessibleName = "Hotkeys suppressed",
             Margin = new Padding(0),
         };
-        _captureButton = new RoundedButton { Text = string.Empty, Width = 160, Height = 32, Accent = true };
-        _saveButton = new RoundedButton { Text = "Save", Width = 64, Height = 32, Quiet = false };
-        _discardButton = new RoundedButton { Text = string.Empty, Width = 88, Height = 32 };
+        _captureButton = new RoundedButton { Text = "Capture", Width = 160, Height = 30, Accent = true };
+        _saveButton = new RoundedButton { Text = "Save", Width = 64, Height = 30 };
+        _discardButton = new RoundedButton { Text = "Discard", Width = 88, Height = 30 };
         _doneButton = new RoundedButton
         {
-            Text = "✓  Done",
+            Text = "Done",
             Width = 72,
-            Height = 32,
-            ForeColor = Theme.Success,
+            Height = 30,
             Enabled = false,
         };
         _fullScreenButton = new RoundedButton { Text = "⛶", Width = 32, Height = 32, Quiet = true };
@@ -275,6 +295,13 @@ public sealed class MainForm : Form
             _preview.Invalidate();
         };
         BuildUi();
+        _sidebarCollapsed = _config.SidebarCollapsed ?? ClientSize.Width < SidebarCollapseBreakpoint;
+        if (!_config.SidebarCollapsed.HasValue)
+        {
+            _config.SidebarCollapsed = _sidebarCollapsed;
+            SaveCurrentConfig();
+        }
+        ApplySidebarCollapsed(_sidebarCollapsed);
         EnableFileDrop(this);
         AttachHotkeyFocusEvents(this);
         ApplyMainButtonTooltips(this);
@@ -284,7 +311,23 @@ public sealed class MainForm : Form
         _alwaysOnTopCheck.Checked = _config.AlwaysOnTop;
         _hideWhileCapturingCheck.Checked = _config.HideWhileCapturing;
         SetStatus(_configWarning ?? GetCaptureReadyMessage());
-        Resize += (_, _) => UpdateWindowRegion();
+        _lastResponsiveWidth = ClientSize.Width;
+        Resize += (_, _) =>
+        {
+            int width = ClientSize.Width;
+            UpdateSidebarCountCapacity();
+            if (_lastResponsiveWidth >= SidebarCollapseBreakpoint
+                && width < SidebarCollapseBreakpoint
+                && !_sidebarCollapsed)
+            {
+                _sidebarCollapsed = true;
+                _config.SidebarCollapsed = true;
+                ApplySidebarCollapsed(true);
+                SaveCurrentConfig();
+            }
+            _lastResponsiveWidth = width;
+            UpdateWindowRegion();
+        };
         Shown += (_, _) => UpdateWindowRegion();
         Activated += (_, _) => UpdateHotkeyIndicator();
         Deactivate += (_, _) => UpdateHotkeyIndicator();
@@ -315,6 +358,13 @@ public sealed class MainForm : Form
             _config.HideWhileCapturing = _hideWhileCapturingCheck.Checked;
             SaveCurrentConfig();
         };
+        _sidebarToggleButton!.Click += (_, _) =>
+        {
+            _sidebarCollapsed = !_sidebarCollapsed;
+            _config.SidebarCollapsed = _sidebarCollapsed;
+            ApplySidebarCollapsed(_sidebarCollapsed);
+            SaveCurrentConfig();
+        };
     }
 
     private string? _configWarning;
@@ -323,37 +373,21 @@ public sealed class MainForm : Form
     {
         var root = new TableLayoutPanel
         {
-            Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
+            Dock = DockStyle.Fill,
             BackColor = Theme.Bg,
-            Padding = new Padding(16),
+            Padding = Padding.Empty,
             ColumnCount = 1,
             RowCount = 3,
-            MinimumSize = new Size(1160, 700),
             Margin = Padding.Empty,
         };
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 56));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 98));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 64));
 
         root.Controls.Add(BuildTitleBar(), 0, 0);
         root.Controls.Add(BuildWorkspace(), 0, 1);
         root.Controls.Add(BuildBottomBand(), 0, 2);
-        var viewport = new Panel
-        {
-            Dock = DockStyle.Fill,
-            AutoScroll = true,
-            BackColor = Theme.Bg,
-            Margin = Padding.Empty,
-        };
-        viewport.Controls.Add(root);
-        viewport.SizeChanged += (_, _) =>
-        {
-            root.Width = Math.Max(root.MinimumSize.Width, viewport.ClientSize.Width);
-            root.Height = Math.Max(root.MinimumSize.Height, viewport.ClientSize.Height);
-        };
-        Controls.Add(viewport);
-        root.Width = Math.Max(root.MinimumSize.Width, viewport.ClientSize.Width);
-        root.Height = Math.Max(root.MinimumSize.Height, viewport.ClientSize.Height);
+        Controls.Add(root);
     }
 
     private Control BuildBottomBand()
@@ -362,20 +396,17 @@ public sealed class MainForm : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 5,
+            RowCount = 3,
             Margin = Padding.Empty,
             BackColor = Theme.Bg,
         };
-        band.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
         band.RowStyles.Add(new RowStyle(SizeType.Absolute, 1));
-        band.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
-        band.RowStyles.Add(new RowStyle(SizeType.Absolute, 1));
-        band.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
-        band.Controls.Add(BuildZoneBar(), 0, 0);
-        band.Controls.Add(CreateDivider(), 0, 1);
-        band.Controls.Add(BuildFooter(), 0, 2);
-        band.Controls.Add(CreateDivider(), 0, 3);
-        band.Controls.Add(BuildCountStrip(), 0, 4);
+        band.RowStyles.Add(new RowStyle(SizeType.Absolute, 23));
+        band.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+        band.Controls.Add(CreateDivider(), 0, 0);
+        band.Controls.Add(_shortcutPanel, 0, 1);
+        band.Controls.Add(BuildZoneBar(), 0, 2);
+        RefreshShortcutRow();
         return band;
     }
 
@@ -385,35 +416,98 @@ public sealed class MainForm : Form
         {
             Dock = DockStyle.Fill,
             BackColor = Theme.Bg,
-            ColumnCount = 2,
+            ColumnCount = 3,
             RowCount = 1,
-            Margin = new Padding(0),
+            Padding = new Padding(16, 0, 16, 0),
+            Margin = Padding.Empty,
         };
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        header.Paint += (_, e) =>
+        {
+            using var border = new Pen(Theme.Border);
+            e.Graphics.DrawLine(border, 0, header.Height - 1, header.Width, header.Height - 1);
+        };
+        var titleGroup = new FlowLayoutPanel
+        {
+            AutoSize = true,
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Padding = Padding.Empty,
+            Margin = Padding.Empty,
+            BackColor = Theme.Bg,
+        };
         var title = new Label
         {
             Text = "Zone Labeller",
             AutoSize = true,
             ForeColor = Theme.Text,
-            Font = new Font("Segoe UI Semibold", 10f, FontStyle.Bold),
+            Font = new Font("Segoe UI Semibold", 9.75f, FontStyle.Bold),
             TextAlign = ContentAlignment.MiddleLeft,
-            Anchor = AnchorStyles.Left,
-            Padding = Padding.Empty,
-            Margin = Padding.Empty,
+            Margin = new Padding(0, 0, 8, 0),
         };
-        title.Dock = DockStyle.Left;
-        header.Controls.Add(title, 0, 0);
+        var version = new Label
+        {
+            Text = typeof(MainForm).Assembly.GetName().Version?.ToString(3) ?? "1.0.1",
+            AutoSize = true,
+            ForeColor = Theme.Muted,
+            Font = new Font("Segoe UI", 8.25f),
+            TextAlign = ContentAlignment.MiddleLeft,
+            Margin = new Padding(0, 0, 8, 0),
+        };
+        _sidebarToggleButton = new RoundedButton
+        {
+            Text = string.Empty,
+            Width = 32,
+            Height = 32,
+            Quiet = true,
+            Icon = RoundedButtonIcon.Sidebar,
+            AccessibleName = "Toggle sidebar",
+            Margin = new Padding(0),
+        };
+        _windowToolTip.SetToolTip(_sidebarToggleButton, "Collapse or restore the sidebar");
+        titleGroup.Controls.Add(title);
+        titleGroup.Controls.Add(version);
+        titleGroup.Controls.Add(_sidebarToggleButton);
+        title.MouseDown += DragWindow;
+        title.DoubleClick += (_, _) => ToggleFullScreen();
+        version.MouseDown += DragWindow;
+        version.DoubleClick += (_, _) => ToggleFullScreen();
+        header.Controls.Add(titleGroup, 0, 0);
+
+        var status = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 3,
+            RowCount = 1,
+            Margin = new Padding(8, 0, 16, 0),
+            BackColor = Theme.Bg,
+        };
+        status.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 16));
+        status.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        status.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 16));
+        status.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+        status.Height = 48;
+        _statusLabel.TextAlign = ContentAlignment.MiddleRight;
+        _statusLabel.AutoSize = false;
+        _statusLabel.Margin = Padding.Empty;
+        _statusIcon.Anchor = AnchorStyles.None;
+        _hotkeyIndicator.Anchor = AnchorStyles.None;
+        status.Controls.Add(_statusIcon, 0, 0);
+        status.Controls.Add(_statusLabel, 1, 0);
+        status.Controls.Add(_hotkeyIndicator, 2, 0);
+        header.Controls.Add(status, 1, 0);
 
         var rightControls = new FlowLayoutPanel
         {
-            Dock = DockStyle.Fill,
+            AutoSize = true,
             FlowDirection = FlowDirection.LeftToRight,
             WrapContents = false,
-            Padding = new Padding(0),
+            Padding = Padding.Empty,
             BackColor = Theme.Bg,
-            Margin = new Padding(0),
-            AutoSize = true,
+            Margin = Padding.Empty,
         };
         var actions = new FlowLayoutPanel
         {
@@ -421,19 +515,21 @@ public sealed class MainForm : Form
             FlowDirection = FlowDirection.LeftToRight,
             WrapContents = false,
             Margin = new Padding(0, 0, 16, 0),
-            Padding = new Padding(0, 12, 0, 12),
+            Padding = new Padding(0, 9, 0, 9),
             BackColor = Theme.Bg,
         };
         foreach (RoundedButton button in new[] { _captureButton, _discardButton, _saveButton, _doneButton })
         {
-            button.Margin = new Padding(0, 0, 8, 0);
+            button.Height = 30;
+            button.Margin = new Padding(0, 0, button == _doneButton ? 0 : 8, 0);
             actions.Controls.Add(button);
         }
 
         var divider = CreateDivider();
         divider.Width = 1;
-        divider.Dock = DockStyle.Left;
-        divider.Margin = new Padding(0, 12, 16, 12);
+        divider.Height = 30;
+        divider.Dock = DockStyle.None;
+        divider.Margin = new Padding(0, 0, 16, 0);
 
         var windowControls = new FlowLayoutPanel
         {
@@ -441,14 +537,14 @@ public sealed class MainForm : Form
             FlowDirection = FlowDirection.LeftToRight,
             WrapContents = false,
             Margin = Padding.Empty,
-            Padding = new Padding(0, 12, 0, 12),
+            Padding = new Padding(0, 8, 0, 8),
             BackColor = Theme.Bg,
         };
         var close = new RoundedButton { Text = "×", Width = 32, Height = 32, Quiet = true };
         var minimize = new RoundedButton { Text = "−", Width = 32, Height = 32, Quiet = true };
         _fullScreenButton.Width = 32;
         _fullScreenButton.Height = 32;
-        foreach (RoundedButton button in new[] { _fullScreenButton, minimize, close })
+        foreach (RoundedButton button in new[] { minimize, _fullScreenButton, close })
         {
             button.Margin = new Padding(0, 0, 8, 0);
             windowControls.Controls.Add(button);
@@ -462,10 +558,7 @@ public sealed class MainForm : Form
         rightControls.Controls.Add(actions);
         rightControls.Controls.Add(divider);
         rightControls.Controls.Add(windowControls);
-        header.Controls.Add(rightControls, 1, 0);
-
-        title.MouseDown += DragWindow;
-        title.DoubleClick += (_, _) => ToggleFullScreen();
+        header.Controls.Add(rightControls, 2, 0);
         return header;
     }
 
@@ -474,13 +567,13 @@ public sealed class MainForm : Form
         var workspace = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
-            ColumnCount = 3,
+            ColumnCount = 2,
             RowCount = 1,
-            Margin = new Padding(0),
+            Margin = Padding.Empty,
         };
         workspace.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        workspace.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 1));
-        workspace.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 280));
+        workspace.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, ExpandedSidebarWidth));
+        _workspaceLayout = workspace;
 
         var previewFrame = new GlassPanel
         {
@@ -514,10 +607,10 @@ public sealed class MainForm : Form
         cropLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 192));
         var cropCaption = new Label
         {
-            Text = "Crop 96",
+            Text = "CROP · 96 × 96",
             Dock = DockStyle.Fill,
             ForeColor = Theme.Muted,
-            Font = new Font("Segoe UI Semibold", 8.25f, FontStyle.Bold),
+            Font = new Font("Segoe UI", 8.25f),
             TextAlign = ContentAlignment.MiddleLeft,
             Margin = new Padding(0),
         };
@@ -538,97 +631,88 @@ public sealed class MainForm : Form
             cropSurface.Location = new Point(previewFrame.ClientSize.Width - cropSurface.Width - 16,
                 previewFrame.ClientSize.Height - cropSurface.Height - 16);
 
-        var separator = new Panel
-        {
-            Dock = DockStyle.Fill,
-            BackColor = Theme.Border,
-            Margin = new Padding(0),
-        };
         workspace.Controls.Add(previewFrame, 0, 0);
-        workspace.Controls.Add(separator, 1, 0);
-        workspace.Controls.Add(BuildSidebar(), 2, 0);
+        workspace.Controls.Add(BuildSidebar(), 1, 0);
         return workspace;
     }
 
     private Control BuildSidebar()
     {
-        var sidebar = new GlassPanel
+        var sidebar = _sidebarSurface = new GlassPanel
         {
             Dock = DockStyle.Fill,
             SurfaceColor = Theme.Panel,
             EdgeColor = Theme.Border,
             Padding = new Padding(16),
-            Margin = new Padding(0),
+            Margin = Padding.Empty,
         };
-        var layout = new TableLayoutPanel
+        var layout = _sidebarLayout = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
             BackColor = Color.Transparent,
             ColumnCount = 1,
-            RowCount = 6,
-            Margin = new Padding(0),
+            RowCount = 8,
+            Margin = Padding.Empty,
         };
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 24));
-        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 18));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 230));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 1));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 72));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 72));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 68));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 68));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        var caption = new Label
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
+        var caption = _sidebarCaption = new Label
         {
-            Text = "Label counts",
+            Text = "LABEL COUNTS",
             AutoSize = true,
             ForeColor = Theme.Muted,
-            Font = new Font("Segoe UI Semibold", 8.25f, FontStyle.Bold),
+            Font = new Font("Segoe UI", 7.5f),
             TextAlign = ContentAlignment.MiddleLeft,
-            Margin = new Padding(0, 0, 0, 8),
+            Margin = Padding.Empty,
         };
-        var countsFrame = new GlassPanel
-        {
-            Dock = DockStyle.Top,
-            SurfaceColor = Theme.Panel,
-            EdgeColor = Theme.Border,
-            Padding = new Padding(1),
-            Margin = new Padding(0, 0, 0, 8),
-        };
-        countsFrame.Controls.Add(_countList);
-        var utilityActions = new FlowLayoutPanel
+        var countsFrame = _countsFrame = new GlassPanel
         {
             Dock = DockStyle.Fill,
-            FlowDirection = FlowDirection.LeftToRight,
+            SurfaceColor = Theme.Panel,
+            EdgeColor = Theme.Border,
+            Padding = new Padding(0),
+            Margin = Padding.Empty,
+        };
+        countsFrame.Controls.Add(_countList);
+        var utilityActions = _utilityActions = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.RightToLeft,
             WrapContents = false,
             Padding = Padding.Empty,
             Margin = Padding.Empty,
             BackColor = Color.Transparent,
         };
-        var openFolder = new RoundedButton
+        var openFolder = _openFolderButton = new RoundedButton
         {
             Width = 32,
             Height = 32,
-            Quiet = true,
             Icon = RoundedButtonIcon.Folder,
             AccessibleName = "Open dataset folder",
         };
-        var reset = new RoundedButton
+        var reset = _refreshCountsButton = new RoundedButton
         {
             Width = 32,
             Height = 32,
-            Quiet = true,
             Icon = RoundedButtonIcon.Refresh,
             AccessibleName = "Refresh counts",
         };
-        openFolder.AccessibleName = "Open dataset folder";
-        reset.AccessibleName = "Refresh counts";
         _windowToolTip.SetToolTip(openFolder, "Open dataset folder");
         _windowToolTip.SetToolTip(reset, "Refresh counts");
         openFolder.Margin = new Padding(0, 0, 8, 0);
-        reset.Margin = Padding.Empty;
+        reset.Margin = new Padding(0);
         openFolder.Click += (_, _) => OpenDatasetFolder();
         reset.Click += (_, _) => RefreshCounts();
-        utilityActions.Controls.Add(openFolder);
         utilityActions.Controls.Add(reset);
+        utilityActions.Controls.Add(openFolder);
 
-        var mainActions = new FlowLayoutPanel
+        var mainActions = _mainActions = new FlowLayoutPanel
         {
             Dock = DockStyle.Fill,
             FlowDirection = FlowDirection.TopDown,
@@ -637,18 +721,30 @@ public sealed class MainForm : Form
             Margin = Padding.Empty,
             BackColor = Color.Transparent,
         };
-        var settings = new RoundedButton { Text = "Label settings", Width = 246, Height = 32 };
-        var gallery = new RoundedButton { Text = "Capture library", Width = 246, Height = 32 };
+        var settings = _settingsButton = new RoundedButton
+        {
+            Text = "Label settings",
+            Width = ExpandedSidebarWidth - 34,
+            Height = 30,
+            AccessibleName = "Label settings",
+            Margin = new Padding(0, 0, 0, 8),
+        };
+        var gallery = _galleryButton = new RoundedButton
+        {
+            Text = "Capture library",
+            Width = ExpandedSidebarWidth - 34,
+            Height = 30,
+            AccessibleName = "Capture library",
+            Margin = Padding.Empty,
+        };
         _windowToolTip.SetToolTip(settings, "Edit label zones, targets, retention, and shortcuts.");
         _windowToolTip.SetToolTip(gallery, "Browse and reopen saved captures.");
-        settings.Margin = new Padding(0, 0, 0, 8);
-        gallery.Margin = Padding.Empty;
         settings.Click += (_, _) => EditSettings();
         gallery.Click += (_, _) => OpenGallery();
         mainActions.Controls.Add(settings);
         mainActions.Controls.Add(gallery);
 
-        var toggles = new FlowLayoutPanel
+        var toggles = _toggles = new FlowLayoutPanel
         {
             Dock = DockStyle.Fill,
             FlowDirection = FlowDirection.TopDown,
@@ -657,20 +753,22 @@ public sealed class MainForm : Form
             Margin = Padding.Empty,
             BackColor = Color.Transparent,
         };
-        _alwaysOnTopCheck.Margin = new Padding(0, 0, 0, 8);
+        _alwaysOnTopCheck.Margin = new Padding(0, 0, 0, 4);
         _hideWhileCapturingCheck.Margin = Padding.Empty;
         _windowToolTip.SetToolTip(_alwaysOnTopCheck, "Keep Zone Labeller above other windows.");
         _windowToolTip.SetToolTip(_hideWhileCapturingCheck, "Hide Zone Labeller while capturing the screen.");
         toggles.Controls.Add(_alwaysOnTopCheck);
         toggles.Controls.Add(_hideWhileCapturingCheck);
 
-        var sidebarFooter = new TableLayoutPanel
+        var sidebarFooter = _sidebarFooter = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 1,
-            Margin = new Padding(0),
+            RowCount = 2,
+            Margin = Padding.Empty,
         };
+        sidebarFooter.RowStyles.Add(new RowStyle(SizeType.Absolute, 20));
+        sidebarFooter.RowStyles.Add(new RowStyle(SizeType.Absolute, 18));
         var repositoryLink = new LinkLabel
         {
             Text = "github.com/phr3nic/ZoneLabels",
@@ -680,7 +778,7 @@ public sealed class MainForm : Form
             ActiveLinkColor = Theme.Text,
             VisitedLinkColor = Theme.Muted,
             Font = new Font("Segoe UI", 8.25f),
-            Margin = new Padding(0),
+            Margin = Padding.Empty,
             BackColor = Color.Transparent,
             TabStop = true,
             LinkBehavior = LinkBehavior.NeverUnderline,
@@ -703,14 +801,26 @@ public sealed class MainForm : Form
                 SetStatus($"Could not open repository link. See {Log.FilePath}.", true);
             }
         };
+        var sidebarVersion = new Label
+        {
+            Text = typeof(MainForm).Assembly.GetName().Version?.ToString(3) ?? "1.0.1",
+            Dock = DockStyle.Fill,
+            ForeColor = Theme.Muted,
+            Font = new Font("Segoe UI", 8.25f),
+            TextAlign = ContentAlignment.MiddleLeft,
+            Margin = Padding.Empty,
+        };
         sidebarFooter.Controls.Add(repositoryLink, 0, 0);
+        sidebarFooter.Controls.Add(sidebarVersion, 0, 1);
 
         layout.Controls.Add(caption, 0, 0);
         layout.Controls.Add(countsFrame, 0, 1);
-        layout.Controls.Add(utilityActions, 0, 2);
-        layout.Controls.Add(mainActions, 0, 3);
-        layout.Controls.Add(toggles, 0, 4);
-        layout.Controls.Add(sidebarFooter, 0, 5);
+        layout.Controls.Add(CreateDivider(), 0, 2);
+        layout.Controls.Add(utilityActions, 0, 3);
+        layout.Controls.Add(mainActions, 0, 4);
+        layout.Controls.Add(toggles, 0, 5);
+        layout.Controls.Add(new Panel { Dock = DockStyle.Fill, BackColor = Color.Transparent }, 0, 6);
+        layout.Controls.Add(sidebarFooter, 0, 7);
         sidebar.Controls.Add(layout);
         return sidebar;
     }
@@ -721,38 +831,104 @@ public sealed class MainForm : Form
         _zoneButtonsPanel.WrapContents = false;
         _zoneButtonsPanel.AutoScroll = true;
         _zoneButtonsPanel.Padding = new Padding(16, 0, 16, 0);
-        _zoneButtonsPanel.Margin = new Padding(0);
+        _zoneButtonsPanel.Margin = Padding.Empty;
+        _zoneButtonsPanel.VerticalScroll.Enabled = false;
+        _zoneButtonsPanel.VerticalScroll.Visible = false;
         return _zoneButtonsPanel;
     }
 
-    private Control BuildFooter()
+    private void RefreshShortcutRow()
     {
-        var statusRow = new TableLayoutPanel
+        _shortcutPanel.SuspendLayout();
+        DisposeChildren(_shortcutPanel);
+        (string Key, string Label)[] shortcuts =
+        [
+            (FormatConfiguredKey(_config.CaptureKey), "Capture"),
+            (FormatConfiguredKey(_config.DiscardKey), "Discard"),
+            ("Ctrl+Z", "Undo"),
+            ("Ctrl+Shift+Z", "Redo"),
+            (_config.PrecisionKey, "Precision"),
+            ("Wheel", "Zoom"),
+            ("Right drag", "Pan"),
+        ];
+        foreach ((string key, string label) in shortcuts)
         {
-            Dock = DockStyle.Fill,
-            ColumnCount = 3,
-            Margin = new Padding(0),
-            Padding = new Padding(16, 0, 0, 0),
-            BackColor = Theme.Bg,
-        };
-        statusRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 16));
-        statusRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        statusRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 24));
-        statusRow.Controls.Add(_statusIcon, 0, 0);
-        statusRow.Controls.Add(_statusLabel, 1, 0);
-        statusRow.Controls.Add(_hotkeyIndicator, 2, 0);
-        return statusRow;
+            var hint = new ShortcutHint(key, label)
+            {
+                Margin = new Padding(0, 0, 14, 0),
+            };
+            _shortcutPanel.Controls.Add(hint);
+        }
+        _shortcutPanel.ResumeLayout(true);
     }
 
-    private Control BuildCountStrip()
+    private void ApplySidebarCollapsed(bool collapsed)
     {
-        _datasetCountStrip.Dock = DockStyle.Fill;
-        _datasetCountStrip.FlowDirection = FlowDirection.LeftToRight;
-        _datasetCountStrip.WrapContents = false;
-        _datasetCountStrip.AutoScroll = true;
-        _datasetCountStrip.Margin = new Padding(0);
-        _datasetCountStrip.Padding = new Padding(16, 0, 16, 0);
-        return _datasetCountStrip;
+        if (_sidebarSurface is null || _workspaceLayout is null || _sidebarLayout is null)
+            return;
+
+        _sidebarCollapsed = collapsed;
+        int width = collapsed ? CollapsedSidebarWidth : ExpandedSidebarWidth;
+        _workspaceLayout.ColumnStyles[1].Width = width;
+        _sidebarSurface.Padding = new Padding(collapsed ? 8 : 16);
+        _sidebarCaption!.Visible = !collapsed;
+        _countsFrame!.Visible = !collapsed;
+        _sidebarFooter!.Visible = !collapsed;
+
+        _sidebarLayout.RowStyles[0].Height = collapsed ? 0 : 18;
+        if (collapsed)
+            _sidebarLayout.RowStyles[1].Height = 0;
+        else
+            UpdateSidebarCountCapacity();
+        _sidebarLayout.RowStyles[2].Height = 1;
+        _sidebarLayout.RowStyles[3].Height = collapsed ? 72 : 32;
+        _sidebarLayout.RowStyles[4].Height = collapsed ? 72 : 68;
+        _sidebarLayout.RowStyles[5].Height = 68;
+        _sidebarLayout.RowStyles[7].Height = collapsed ? 0 : 38;
+
+        _utilityActions!.FlowDirection = collapsed ? FlowDirection.TopDown : FlowDirection.RightToLeft;
+        _utilityActions.Controls.SetChildIndex(
+            collapsed ? _openFolderButton! : _refreshCountsButton!, 0);
+        foreach (RoundedButton button in new[] { _openFolderButton!, _refreshCountsButton! })
+        {
+            button.Margin = collapsed ? new Padding(0, 0, 0, 8) : new Padding(0);
+            button.Quiet = false;
+        }
+
+        int contentWidth = Math.Max(32, width - (collapsed ? 18 : 34));
+        _mainActions!.FlowDirection = FlowDirection.TopDown;
+        _settingsButton!.Width = collapsed ? 32 : contentWidth;
+        _galleryButton!.Width = collapsed ? 32 : contentWidth;
+        _settingsButton.Height = collapsed ? 32 : 30;
+        _galleryButton.Height = collapsed ? 32 : 30;
+        _settingsButton.Text = collapsed ? string.Empty : "Label settings";
+        _galleryButton.Text = collapsed ? string.Empty : "Capture library";
+        _settingsButton.Icon = collapsed ? RoundedButtonIcon.Settings : RoundedButtonIcon.None;
+        _galleryButton.Icon = collapsed ? RoundedButtonIcon.Library : RoundedButtonIcon.None;
+        _settingsButton.Margin = collapsed ? new Padding(0, 0, 0, 8) : new Padding(0, 0, 0, 8);
+        _galleryButton.Margin = Padding.Empty;
+
+        _alwaysOnTopCheck.ShowLabel = !collapsed;
+        _hideWhileCapturingCheck.ShowLabel = !collapsed;
+        _alwaysOnTopCheck.Width = contentWidth;
+        _hideWhileCapturingCheck.Width = contentWidth;
+        _sidebarToggleButton!.Icon = collapsed ? RoundedButtonIcon.SidebarExpand : RoundedButtonIcon.Sidebar;
+        _windowToolTip.SetToolTip(_sidebarToggleButton,
+            collapsed ? "Restore the sidebar" : "Collapse the sidebar");
+        UpdateCountRowWidths();
+        PerformLayout();
+    }
+
+    private void UpdateSidebarCountCapacity()
+    {
+        if (_sidebarLayout is null || _sidebarSurface is null || _sidebarCollapsed)
+            return;
+
+        int fixedHeight = 18 + 1 + 32 + 68 + 68 + 38;
+        int availableHeight = Math.Max(42,
+            _sidebarSurface.ClientSize.Height - _sidebarSurface.Padding.Vertical - fixedHeight);
+        int contentHeight = Math.Max(42, _config.Zones.Count * 38 + 2);
+        _sidebarLayout.RowStyles[1].Height = Math.Min(320, Math.Min(availableHeight, contentHeight));
     }
 
     private static Control CreateDivider() => new Panel
@@ -766,12 +942,14 @@ public sealed class MainForm : Form
     {
         string capture = FormatConfiguredKey(_config.CaptureKey);
         string discard = FormatConfiguredKey(_config.DiscardKey);
-        _captureButton.Text = $"Capture  [{capture}]";
-        _discardButton.Text = $"Discard  [{discard}]";
+        _captureButton.Text = "Capture";
+        _captureButton.TrailingHint = capture;
+        _discardButton.Text = "Discard";
         FitButtonToText(_captureButton);
         FitButtonToText(_discardButton);
         FitButtonToText(_saveButton);
         FitButtonToText(_doneButton);
+        RefreshShortcutRow();
         bool globalCapture = AppConfig.ParseHotkey(_config.CaptureKey).Modifiers.HasFlag(HotkeyModifiers.Alt);
         _windowToolTip.SetToolTip(_captureButton, $"Capture ({capture}). "
             + (globalCapture
@@ -790,8 +968,13 @@ public sealed class MainForm : Form
         UpdateHotkeyIndicator();
     }
 
-    private static void FitButtonToText(RoundedButton button) =>
-        button.Width = Math.Max(32, TextRenderer.MeasureText(button.Text, button.Font).Width + 24);
+    private static void FitButtonToText(RoundedButton button)
+    {
+        int width = TextRenderer.MeasureText(button.Text, button.Font).Width + 24;
+        if (!string.IsNullOrEmpty(button.TrailingHint))
+            width += TextRenderer.MeasureText(button.TrailingHint, button.Font).Width + 16;
+        button.Width = Math.Max(32, width);
+    }
 
     private void ApplyMainButtonTooltips(Control parent)
     {
@@ -821,9 +1004,6 @@ public sealed class MainForm : Form
         _countList.SuspendLayout();
         DisposeChildren(_countList);
         _countLabels.Clear();
-        _datasetCountStrip.SuspendLayout();
-        DisposeChildren(_datasetCountStrip);
-        _countStripLabels.Clear();
 
         foreach (ZoneConfig zone in _config.Zones)
         {
@@ -831,18 +1011,25 @@ public sealed class MainForm : Form
                 _counts[zone.Name] = 0;
 
             string keyText = FormatConfiguredKey(zone.Key);
+            int target = GetTargetCount(zone.Name);
             var button = new RoundedButton
             {
                 Text = zone.Name,
                 KeyChipText = keyText,
+                SubLabel = $"{_counts[zone.Name]} / {target}",
+                SubLabelColor = _counts[zone.Name] < target ? Theme.Warn : Theme.Muted,
                 Width = 96,
-                Height = 32,
-                Margin = new Padding(0, 0, 8, 0),
+                Height = 36,
+                Margin = new Padding(0, 0, 6, 0),
+                Font = ZoneButtonFont,
                 Enabled = _frameIsFrozen,
                 Selected = _pins.LastOrDefault()?.Zone is string activeZone
                     && string.Equals(activeZone, zone.Name, StringComparison.OrdinalIgnoreCase),
             };
-            button.Width = Math.Max(96, TextRenderer.MeasureText(zone.Name, button.Font).Width + 18 + 8 + 24);
+            int labelWidth = Math.Max(
+                TextRenderer.MeasureText(zone.Name, ZoneButtonFont).Width,
+                TextRenderer.MeasureText(button.SubLabel, ZoneCountFont).Width);
+            button.Width = Math.Max(96, labelWidth + 18 + 8 + 24);
             string zoneName = zone.Name;
             button.Click += (_, _) => AssignZone(zoneName);
             _windowToolTip.SetToolTip(button, $"Label {zone.Name} ({keyText})");
@@ -852,35 +1039,17 @@ public sealed class MainForm : Form
             var countRow = new ZoneCountRow(zone.Name, _counts[zone.Name], GetTargetCount(zone.Name))
             {
                 Width = Math.Max(0, _countList.ClientSize.Width - SystemInformation.VerticalScrollBarWidth),
-                Height = 40,
+                Height = 38,
                 Margin = Padding.Empty,
             };
             _countLabels[zone.Name] = countRow;
             _countList.Controls.Add(countRow);
-
-            var stripLabel = new Label
-            {
-                AutoSize = false,
-                Text = $"{zone.Name}  {_counts[zone.Name]} / {GetTargetCount(zone.Name)}",
-                ForeColor = Theme.Text,
-                Font = new Font("Consolas", 8.25f),
-                TextAlign = ContentAlignment.MiddleLeft,
-                Height = 32,
-                Margin = new Padding(0, 0, 24, 0),
-                Padding = new Padding(0, 0, 0, 0),
-            };
-            stripLabel.Width = TextRenderer.MeasureText(stripLabel.Text, stripLabel.Font).Width + 2;
-            _countStripLabels[zone.Name] = stripLabel;
-            _datasetCountStrip.Controls.Add(stripLabel);
         }
 
         _zoneButtonsPanel.ResumeLayout(true);
         ApplyMainButtonTooltips(_zoneButtonsPanel);
         _countList.ResumeLayout(true);
-        _datasetCountStrip.ResumeLayout(true);
-        if (_countList.Parent is Control countsFrame)
-            countsFrame.Height = Math.Min(320, _countList.Controls.Cast<Control>()
-                .Sum(control => control.Height + control.Margin.Vertical) + 2);
+        UpdateSidebarCountCapacity();
         UpdateCountRowWidths();
         RefreshConfigUi();
         UpdateHotkeys();
@@ -910,6 +1079,7 @@ public sealed class MainForm : Form
     {
         updated.AlwaysOnTop = _config.AlwaysOnTop;
         updated.HideWhileCapturing = _config.HideWhileCapturing;
+        updated.SidebarCollapsed = _config.SidebarCollapsed;
         updated.MinPinSpacing = _config.MinPinSpacing;
         if (WindowState == FormWindowState.Normal && !_isFullScreen)
         {
@@ -1365,12 +1535,15 @@ public sealed class MainForm : Form
                 ScreenLeft = monitorBounds.Left,
                 ScreenTop = monitorBounds.Top,
             });
+            _manifestStore.AddCapture(imagePath, "todo");
             return imagePath;
         }
         catch
         {
             if (File.Exists(temporaryImage)) File.Delete(temporaryImage);
             if (File.Exists(imagePath)) File.Delete(imagePath);
+            string statePath = Path.ChangeExtension(imagePath, ".json");
+            if (File.Exists(statePath)) File.Delete(statePath);
             throw;
         }
     }
@@ -1479,6 +1652,15 @@ public sealed class MainForm : Form
         {
             File.Copy(sourcePath, temporaryPath);
             File.Move(temporaryPath, destinationPath);
+            try
+            {
+                _manifestStore.AddCapture(destinationPath, "todo");
+            }
+            catch
+            {
+                if (File.Exists(destinationPath)) File.Delete(destinationPath);
+                throw;
+            }
         }
         finally
         {
@@ -1505,6 +1687,15 @@ public sealed class MainForm : Form
                 using (var output = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
                     input.CopyTo(output);
                 File.Move(temporaryPath, destinationPath);
+                try
+                {
+                    _manifestStore.AddCapture(destinationPath, "todo");
+                }
+                catch
+                {
+                    if (File.Exists(destinationPath)) File.Delete(destinationPath);
+                    throw;
+                }
                 imported++;
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
@@ -1550,9 +1741,9 @@ public sealed class MainForm : Form
         try
         {
             using var dialog = new GalleryDialog(
-                new[] { _todoDirectory, _legacyGalleryDirectory, _doneDirectory },
                 _doneDirectory,
-                _imageDirectory);
+                _imageDirectory,
+                _manifestStore);
             if (dialog.ShowDialog(this) == DialogResult.OK)
                 selectedCapturePath = dialog.SelectedCapturePath;
         }
@@ -1575,9 +1766,7 @@ public sealed class MainForm : Form
             SetCurrentGalleryCapture(imagePath, frame, capture, viewport);
             string collection = IsDataCrop(imagePath)
                 ? "exported data"
-                : CaptureFileOperations.IsCompleted(imagePath, _doneDirectory)
-                ? "done"
-                : "todo";
+                : _manifestStore.GetStatus(imagePath);
             SetStatus($"Opened {Path.GetFileName(imagePath)} from {collection}. Scroll to zoom; right-drag to pan.");
             return true;
         }
@@ -1591,11 +1780,10 @@ public sealed class MainForm : Form
 
     private string? FindNextTodoCapture()
     {
-        return new[] { _todoDirectory, _legacyGalleryDirectory }
-            .Where(Directory.Exists)
-            .SelectMany(directory => Directory.GetFiles(directory, "*", SearchOption.TopDirectoryOnly))
-            .Where(CaptureFileOperations.IsSupportedImageFile)
-            .Where(path => !CaptureFileOperations.IsCompleted(path, _doneDirectory))
+        return _manifestStore.Manifest.Captures
+            .Where(entry => entry.Status == "todo")
+            .Select(entry => _manifestStore.ResolveFile(entry.File))
+            .Where(File.Exists)
             .OrderBy(File.GetLastWriteTimeUtc)
             .ThenBy(Path.GetFileName, StringComparer.OrdinalIgnoreCase)
             .FirstOrDefault();
@@ -1604,13 +1792,27 @@ public sealed class MainForm : Form
     private GalleryCapture LoadGalleryState(string imagePath, Size frameSize)
     {
         string statePath = GetGalleryStatePath(imagePath);
-        if (!File.Exists(statePath))
-            return new GalleryCapture();
-
-        var state = JsonSerializer.Deserialize<GalleryCapture>(File.ReadAllText(statePath),
-            new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
-            ?? throw new InvalidDataException("The gallery pin data is empty or invalid.");
+        GalleryCapture state = File.Exists(statePath)
+            ? JsonSerializer.Deserialize<GalleryCapture>(File.ReadAllText(statePath),
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+              ?? throw new InvalidDataException("The gallery pin data is empty or invalid.")
+            : new GalleryCapture();
         state.Pins ??= new List<GalleryPin>();
+        if (!IsDataCrop(imagePath))
+        {
+            DatasetCaptureEntry entry = _manifestStore.FindCapture(imagePath)
+                ?? throw new InvalidDataException($"Capture is not present in manifest.json: {imagePath}");
+            var exported = state.Pins.Where(pin => pin.Exported)
+                .Select(pin => (pin.X, pin.Y, pin.Zone))
+                .ToHashSet();
+            state.Pins = entry.Pins.Select(pin => new GalleryPin
+            {
+                X = pin.X,
+                Y = pin.Y,
+                Zone = pin.Zone,
+                Exported = exported.Contains((pin.X, pin.Y, pin.Zone)),
+            }).ToList();
+        }
         foreach (GalleryPin pin in state.Pins)
         {
             if (pin.X < 0 || pin.Y < 0 || pin.X >= frameSize.Width || pin.Y >= frameSize.Height)
@@ -1664,7 +1866,7 @@ public sealed class MainForm : Form
         if (_captureInProgress || _editingSettings || !_frameIsFrozen
             || _currentFrameIsDataCrop || _currentGalleryPath is null)
             return;
-        if (CaptureFileOperations.IsCompleted(_currentGalleryPath, _doneDirectory))
+        if (_manifestStore.GetStatus(_currentGalleryPath) == "done")
         {
             AdvanceToNextTodo(Path.GetFileName(_currentGalleryPath));
             return;
@@ -1687,7 +1889,8 @@ public sealed class MainForm : Form
             if (!PersistPinsOrReport())
                 return;
 
-            completedPath = CaptureFileOperations.MoveToDone(_currentGalleryPath, _doneDirectory);
+            string sourcePath = _currentGalleryPath;
+            completedPath = _manifestStore.MoveToDone(sourcePath, _doneDirectory);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException or InvalidDataException)
         {
@@ -1741,7 +1944,7 @@ public sealed class MainForm : Form
         _doneButton.Enabled = _frameIsFrozen
             && !_currentFrameIsDataCrop
             && _currentGalleryPath is not null
-            && (CaptureFileOperations.IsCompleted(_currentGalleryPath, _doneDirectory)
+            && (_manifestStore.GetStatus(_currentGalleryPath) == "done"
                 || _pins.Count > 0 && _pins.All(pin => !string.IsNullOrWhiteSpace(pin.Zone)));
     }
 
@@ -1759,6 +1962,15 @@ public sealed class MainForm : Form
             Zone = pin.Zone,
             Exported = pin.Exported,
         }).ToList();
+        if (!_currentFrameIsDataCrop)
+        {
+            _manifestStore.UpdatePins(_currentGalleryPath, _pins.Select(pin => new DatasetManifestPin
+            {
+                X = pin.X,
+                Y = pin.Y,
+                Zone = pin.Zone,
+            }));
+        }
         SaveGalleryState(_currentGalleryPath, _currentGallery);
     }
 
@@ -2165,10 +2377,10 @@ public sealed class MainForm : Form
         int target = GetTargetCount(zone);
         if (_countLabels.TryGetValue(zone, out ZoneCountRow? row))
             row.SetCount(count, target);
-        if (_countStripLabels.TryGetValue(zone, out Label? stripLabel))
+        if (_zoneButtons.TryGetValue(zone, out RoundedButton? button))
         {
-            stripLabel.Text = $"{zone}  {count} / {target}";
-            stripLabel.Width = TextRenderer.MeasureText(stripLabel.Text, stripLabel.Font).Width + 2;
+            button.SubLabel = $"{count} / {target}";
+            button.SubLabelColor = count < target ? Theme.Warn : Theme.Muted;
         }
     }
 
@@ -2187,80 +2399,20 @@ public sealed class MainForm : Form
     private bool RecountLabels()
     {
         var recount = _config.Zones.ToDictionary(zone => zone.Name, _ => 0, StringComparer.OrdinalIgnoreCase);
-        try
+        foreach (DatasetCaptureEntry entry in _manifestStore.Manifest.Captures)
         {
-            if (File.Exists(_csvPath))
+            if (entry.Status == "skipped") continue;
+            foreach (DatasetManifestPin pin in entry.Pins)
             {
-                foreach (string line in File.ReadLines(_csvPath))
-                {
-                    if (string.IsNullOrWhiteSpace(line)) continue;
-                    string[] fields = ParseCsvFields(line);
-                    if (fields.Length < 2
-                        || string.Equals(fields[0], "filename", StringComparison.OrdinalIgnoreCase)
-                        && string.Equals(fields[1], "zone", StringComparison.OrdinalIgnoreCase))
-                        continue;
-                    if (recount.ContainsKey(fields[1]))
-                        recount[fields[1]]++;
-                }
+                if (!string.IsNullOrWhiteSpace(pin.Zone) && recount.ContainsKey(pin.Zone))
+                    recount[pin.Zone]++;
             }
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException)
-        {
-            Log.Error("recounting labels.csv failed", ex);
-            if (IsHandleCreated)
-                SetStatus($"Could not read dataset/labels.csv; counts were not refreshed. See {Log.FilePath}.", true);
-            return false;
         }
 
         _counts.Clear();
         foreach (ZoneConfig zone in _config.Zones)
             SetCount(zone.Name, recount[zone.Name]);
         return true;
-    }
-
-    private static string[] ParseCsvFields(string line)
-    {
-        var fields = new List<string>();
-        var field = new StringBuilder();
-        bool quoted = false;
-        for (int index = 0; index < line.Length; index++)
-        {
-            char character = line[index];
-            if (quoted)
-            {
-                if (character == '"' && index + 1 < line.Length && line[index + 1] == '"')
-                {
-                    field.Append('"');
-                    index++;
-                }
-                else if (character == '"')
-                {
-                    quoted = false;
-                }
-                else
-                {
-                    field.Append(character);
-                }
-            }
-            else if (character == ',' )
-            {
-                fields.Add(field.ToString());
-                field.Clear();
-            }
-            else if (character == '"' && field.Length == 0)
-            {
-                quoted = true;
-            }
-            else
-            {
-                field.Append(character);
-            }
-        }
-
-        if (quoted)
-            throw new InvalidDataException("A quoted field in labels.csv was not closed.");
-        fields.Add(field.ToString());
-        return fields.ToArray();
     }
 
     private int GetTargetCount(string zone)
@@ -2285,9 +2437,8 @@ public sealed class MainForm : Form
     {
         try
         {
-            int? removed = CaptureFileOperations.PurgeDone(_doneDirectory, _config.DoneRetentionDays);
-            if (removed.HasValue)
-                Log.Info($"done purge removed {removed.Value} file(s).");
+            int removed = _manifestStore.PurgeDone(_config.DoneRetentionDays);
+            Log.Info($"done purge removed {removed} file(s).");
         }
         catch (Exception ex)
         {
@@ -2299,12 +2450,10 @@ public sealed class MainForm : Form
     {
         try
         {
-            int? removed = CaptureFileOperations.PurgeDone(_doneDirectory, _config.DoneRetentionDays);
-            if (!removed.HasValue)
-                return "No dataset\\done folder exists.";
-            Log.Info($"manual done purge removed {removed.Value} file(s).");
-            SetStatus($"Purged {removed.Value} file(s) from dataset/done.");
-            return $"Removed {removed.Value} file(s).";
+            int removed = _manifestStore.PurgeDone(_config.DoneRetentionDays);
+            Log.Info($"manual done purge removed {removed} file(s).");
+            SetStatus($"Purged {removed} file(s) from dataset/done.");
+            return $"Removed {removed} file(s).";
         }
         catch (Exception ex)
         {
@@ -2326,7 +2475,7 @@ public sealed class MainForm : Form
     private void RefreshCounts()
     {
         if (RecountLabels())
-            SetStatus("Counts refreshed from dataset/labels.csv.");
+            SetStatus("Counts refreshed from manifest.json.");
     }
 
     private void OpenDatasetFolder()
@@ -2448,7 +2597,7 @@ public sealed class MainForm : Form
                     && !_registeredHotkeys.Contains(ZoneHotkeyBase + item.index));
         bool live = !textInputFocused
             && (hasGlobalBinding || _preview.Focused && hasCanvasBinding);
-        _hotkeyIndicator.ForeColor = live ? Theme.Success : Theme.Muted;
+        _hotkeyIndicator.ForeColor = live ? Theme.Accent : Theme.Muted;
         _hotkeyIndicator.AccessibleName = live ? "Hotkeys live" : "Hotkeys suppressed";
         _windowToolTip.SetToolTip(_hotkeyIndicator, live
             ? "Hotkeys live: Alt bindings are global; other bindings work on the canvas."
@@ -2635,10 +2784,62 @@ public sealed class MainForm : Form
         }
     }
 
+    private sealed class HorizontalFlowLayoutPanel : FlowLayoutPanel
+    {
+        private const int WsVScroll = 0x00200000;
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams parameters = base.CreateParams;
+                parameters.Style &= ~WsVScroll;
+                return parameters;
+            }
+        }
+    }
+
+    private sealed class ShortcutHint : Control
+    {
+        private static readonly Font KeyFont = new("Consolas", 7.5f);
+        private static readonly Font LabelFont = new("Segoe UI", 7.5f);
+        private readonly string _key;
+        private readonly string _label;
+        private readonly int _keyWidth;
+
+        public ShortcutHint(string key, string label)
+        {
+            _key = key;
+            _label = label;
+            _keyWidth = Math.Max(18, TextRenderer.MeasureText(key, KeyFont).Width + 12);
+            Width = _keyWidth + 6 + TextRenderer.MeasureText(label, LabelFont).Width + 1;
+            Height = 23;
+            BackColor = Theme.Bg;
+            SetStyle(ControlStyles.UserPaint
+                     | ControlStyles.AllPaintingInWmPaint
+                     | ControlStyles.OptimizedDoubleBuffer
+                     | ControlStyles.ResizeRedraw, true);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.Clear(BackColor);
+            var chipBounds = new Rectangle(0, 2, _keyWidth, 18);
+            using (var chipPath = RoundedButton.CreateRoundedRectanglePath(chipBounds, 6))
+            using (var chipFill = new SolidBrush(Theme.Border))
+                e.Graphics.FillPath(chipFill, chipPath);
+            TextRenderer.DrawText(e.Graphics, _key, KeyFont, chipBounds, Theme.Text,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            TextRenderer.DrawText(e.Graphics, _label, LabelFont,
+                new Rectangle(chipBounds.Right + 6, 0, Width - chipBounds.Right - 6, Height),
+                Theme.Muted, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+        }
+    }
+
     private sealed class ZoneCountRow : Control
     {
         private readonly string _name;
-        private readonly Font _labelFont = new("Segoe UI", 9f);
+        private readonly Font _labelFont = new("Segoe UI Semibold", 9f, FontStyle.Bold);
         private readonly Font _countFont = new("Consolas", 8.25f);
         private int _count;
         private int _target;
@@ -2667,15 +2868,16 @@ public sealed class MainForm : Form
         protected override void OnPaint(PaintEventArgs e)
         {
             e.Graphics.Clear(BackColor);
-            var labelBounds = new Rectangle(0, 0, Math.Max(0, Width - 100), 28);
-            var countBounds = new Rectangle(Math.Max(0, Width - 100), 0, Math.Min(100, Width), 28);
+            var labelBounds = new Rectangle(0, 0, Math.Max(0, Width - 100), 24);
+            var countBounds = new Rectangle(Math.Max(0, Width - 100), 0, Math.Min(100, Width), 24);
             TextRenderer.DrawText(e.Graphics, _name, _labelFont, labelBounds, Theme.Text,
-                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
-            TextRenderer.DrawText(e.Graphics, $"{_count} / {_target}", _countFont, countBounds, Theme.Text,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
+            Color countColor = _count < _target && _target > 0 ? Theme.Warn : Theme.Text;
+            TextRenderer.DrawText(e.Graphics, $"{_count} / {_target}", _countFont, countBounds, countColor,
                 TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
 
-            var track = new Rectangle(0, Height - 5, Width, 3);
-            using (var trackBrush = new SolidBrush(Theme.Border))
+            var track = new Rectangle(8, Height - 9, Math.Max(0, Width - 16), 6);
+            using (var trackBrush = new SolidBrush(Color.FromArgb(46, 255, 255, 255)))
                 e.Graphics.FillRectangle(trackBrush, track);
             float ratio = _target > 0 ? Math.Clamp(_count / (float)_target, 0f, 1f) : 0f;
             int fillWidth = (int)Math.Round(track.Width * ratio);
@@ -2697,16 +2899,19 @@ public sealed class MainForm : Form
         }
     }
 
-    private sealed class ToggleRow : CheckBox
+    private sealed class ToggleRow : Control
     {
         private bool _hovered;
+        private bool _checked;
+        private bool _showLabel = true;
 
         public ToggleRow(string text)
         {
             Text = text;
-            Width = 246;
+            AccessibleName = text;
+            AccessibleRole = AccessibleRole.CheckButton;
+            Width = ExpandedSidebarWidth - 34;
             Height = 32;
-            AutoSize = false;
             BackColor = Theme.Panel;
             ForeColor = Theme.Text;
             Font = new Font("Segoe UI", 9f);
@@ -2717,6 +2922,31 @@ public sealed class MainForm : Form
                      | ControlStyles.OptimizedDoubleBuffer
                      | ControlStyles.ResizeRedraw
                      | ControlStyles.Selectable, true);
+        }
+
+        public event EventHandler? CheckedChanged;
+
+        public bool Checked
+        {
+            get => _checked;
+            set
+            {
+                if (_checked == value) return;
+                _checked = value;
+                Invalidate();
+                CheckedChanged?.Invoke(this, EventArgs.Empty);
+            }
+        }
+
+        public bool ShowLabel
+        {
+            get => _showLabel;
+            set
+            {
+                if (_showLabel == value) return;
+                _showLabel = value;
+                Invalidate();
+            }
         }
 
         protected override void OnMouseEnter(EventArgs e)
@@ -2733,10 +2963,21 @@ public sealed class MainForm : Form
             base.OnMouseLeave(e);
         }
 
-        protected override void OnCheckedChanged(EventArgs e)
+        protected override void OnClick(EventArgs e)
         {
-            Invalidate();
-            base.OnCheckedChanged(e);
+            Checked = !Checked;
+            base.OnClick(e);
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.Space)
+            {
+                Checked = !Checked;
+                e.Handled = true;
+                e.SuppressKeyPress = true;
+            }
+            base.OnKeyDown(e);
         }
 
         protected override void OnGotFocus(EventArgs e)
@@ -2758,24 +2999,23 @@ public sealed class MainForm : Form
             using var backgroundPath = RoundedButton.CreateRectanglePath(bounds);
             using (var background = new SolidBrush(_hovered ? Theme.PanelHi : Theme.Panel))
                 e.Graphics.FillPath(background, backgroundPath);
-            using (var border = new Pen(Focused ? Theme.Text : Theme.Border, 1))
+            using (var border = new Pen(Focused ? Theme.Accent : Theme.Border, 1))
                 e.Graphics.DrawPath(border, backgroundPath);
 
-            var checkBounds = new Rectangle(8, 8, 16, 16);
-            using (var checkFill = new SolidBrush(Checked ? Theme.PanelHi : Theme.Bg))
-                e.Graphics.FillRectangle(checkFill, checkBounds);
-            using (var checkBorder = new Pen(Checked ? Theme.Text : Theme.Muted, 1))
-                e.Graphics.DrawRectangle(checkBorder, checkBounds);
-            if (Checked)
-            {
-                using var check = new Pen(Theme.Text, 2);
-                e.Graphics.DrawLine(check, 11, 16, 14, 19);
-                e.Graphics.DrawLine(check, 14, 19, 21, 12);
-            }
-            TextRenderer.DrawText(e.Graphics, Text, Font, new Rectangle(32, 0, Width - 40, Height),
-                Theme.Text, TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
+            var switchBounds = new Rectangle(Math.Max(2, Width - 42), (Height - 18) / 2, 34, 18);
+            using (var switchPath = RoundedButton.CreateRoundedRectanglePath(switchBounds, 9))
+            using (var switchFill = new SolidBrush(Checked ? Theme.Accent : Theme.Border))
+                e.Graphics.FillPath(switchFill, switchPath);
+            var thumb = new Rectangle(switchBounds.X + (Checked ? 18 : 3),
+                switchBounds.Y + 3, 12, 12);
+            using (var thumbFill = new SolidBrush(Theme.Text))
+                e.Graphics.FillEllipse(thumbFill, thumb);
+            if (ShowLabel)
+                TextRenderer.DrawText(e.Graphics, Text, Font, new Rectangle(8, 0, switchBounds.X - 14, Height),
+                    Theme.Text, TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
             if (Focused)
-                ControlPaint.DrawFocusRectangle(e.Graphics, new Rectangle(4, 4, Width - 9, Height - 9), Theme.Text, Theme.Panel);
+                ControlPaint.DrawFocusRectangle(e.Graphics, new Rectangle(3, 3, Width - 7, Height - 7),
+                    Theme.Accent, Theme.Panel);
         }
     }
 
@@ -2794,6 +3034,7 @@ public sealed class MainForm : Form
 
         private ScreenPin? _hoveredPin;
         private readonly HashSet<ScreenPin> _pinsTooClose = new();
+        private readonly Dictionary<ScreenPin, Rectangle> _pinChipBounds = new();
         private RectangleF _imageRectangle;
         private Point _panStartMouse;
         private Point _mousePosition;
@@ -2817,11 +3058,8 @@ public sealed class MainForm : Form
         private bool _precisionActive;
         private Keys _precisionKey = Keys.LShiftKey;
         private float _precisionFactor = 0.25f;
-        private readonly Font _emptyTitleFont = new("Segoe UI Semibold", 10f, FontStyle.Bold);
-        private readonly Font _emptyBodyFont = new("Segoe UI", 9f);
-        private readonly Font _emptyHintFont = new("Consolas", 8.25f);
+        private readonly Font _emptyLineFont = new("Segoe UI", 9f);
         private readonly Font _dimensionFont = new("Consolas", 8.25f);
-        private readonly Font _instructionFont = new("Consolas", 8.25f);
         private readonly Font _zoomFont = new("Consolas", 8.25f);
         private readonly Font _pinLabelFont = new("Consolas", 8.25f);
 
@@ -2989,16 +3227,11 @@ public sealed class MainForm : Form
             using (var border = new Pen(Theme.Border, 1))
                 graphics.DrawRectangle(border, _imageRectangle.X, _imageRectangle.Y, _imageRectangle.Width, _imageRectangle.Height);
 
-            foreach (ScreenPin pin in Pins)
-                DrawPin(graphics, pin, scale, _imageRectangle);
+            DrawPins(graphics, scale, _imageRectangle, ClientRectangle, cacheChipBounds: true);
 
             var dimensionText = $"{Frame.Width} × {Frame.Height}";
             TextRenderer.DrawText(graphics, dimensionText, _dimensionFont,
                 new Point(12, 10), Color.FromArgb(230, 255, 255, 255));
-            var instruction = "LEFT CLICK  PIN     RIGHT CLICK  DELETE     RIGHT / MIDDLE DRAG  PAN     ESC  STOP PAN     WHEEL  ZOOM";
-            TextRenderer.DrawText(graphics, instruction, _instructionFont,
-                new Rectangle(12, Height - 28, Width - 24, 18), Color.FromArgb(210, 255, 255, 255),
-                TextFormatFlags.Bottom | TextFormatFlags.Left);
             DrawMagnifier(graphics, scale);
             if (_zoom <= 1f)
                 DrawAimMarker(graphics);
@@ -3008,8 +3241,8 @@ public sealed class MainForm : Form
         private void DrawEmptyState(Graphics graphics)
         {
             int cardWidth = Math.Min(380, ClientSize.Width - 48);
-            int cardHeight = 178;
-            if (cardWidth < 220 || ClientSize.Height < 100) return;
+            const int cardHeight = 48;
+            if (cardWidth < 220 || ClientSize.Height < cardHeight) return;
             var card = new Rectangle((ClientSize.Width - cardWidth) / 2,
                 (ClientSize.Height - cardHeight) / 2, cardWidth, cardHeight);
             using var cardPath = RoundedButton.CreateRectanglePath(card);
@@ -3018,68 +3251,9 @@ public sealed class MainForm : Form
             graphics.SmoothingMode = SmoothingMode.AntiAlias;
             graphics.FillPath(fill, cardPath);
             graphics.DrawPath(border, cardPath);
-
-            var iconBounds = new Rectangle(card.X + 26, card.Y + 27, 38, 38);
-            DrawReadyIcon(graphics, iconBounds);
-
-            TextRenderer.DrawText(graphics, "Ready to label", _emptyTitleFont,
-                new Rectangle(card.X + 76, card.Y + 29, card.Width - 100, 26),
-                Theme.Text, TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
-            TextRenderer.DrawText(graphics, "Capture an image, then place and label pins.",
-                _emptyBodyFont, new Rectangle(card.X + 28, card.Y + 88, card.Width - 56, 22),
-                Theme.Muted, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
-
-            var hintBounds = new Rectangle(card.X + 20, card.Y + 128, card.Width - 40, 24);
-            int captureWidth = GetHintChipWidth(CaptureShortcut, "Capture");
-            int zoomWidth = GetHintChipWidth("Wheel", "Zoom");
-            int panWidth = GetHintChipWidth("Right", "Pan");
-            int totalWidth = captureWidth + zoomWidth + panWidth + 16;
-            if (totalWidth <= hintBounds.Width)
-            {
-                int x = hintBounds.X + (hintBounds.Width - totalWidth) / 2;
-                DrawHintChip(graphics, hintBounds.Y, x, CaptureShortcut, "Capture");
-                DrawHintChip(graphics, hintBounds.Y, x + captureWidth + 8, "Wheel", "Zoom");
-                DrawHintChip(graphics, hintBounds.Y, x + captureWidth + zoomWidth + 16, "Right", "Pan");
-            }
-            else
-            {
-                DrawHintChip(graphics, hintBounds.Y - 4,
-                    hintBounds.X + (hintBounds.Width - captureWidth) / 2, CaptureShortcut, "Capture");
-                int secondaryWidth = zoomWidth + panWidth + 8;
-                int x = hintBounds.X + (hintBounds.Width - secondaryWidth) / 2;
-                DrawHintChip(graphics, hintBounds.Y + 20, x, "Wheel", "Zoom");
-                DrawHintChip(graphics, hintBounds.Y + 20, x + zoomWidth + 8, "Right", "Pan");
-            }
-        }
-
-        private void DrawReadyIcon(Graphics graphics, Rectangle bounds)
-        {
-            graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            using var pen = new Pen(Theme.Muted, 1.5f) { StartCap = LineCap.Round, EndCap = LineCap.Round };
-            graphics.DrawRectangle(pen, bounds.X + 8, bounds.Y + 8, 22, 18);
-            graphics.DrawLine(pen, bounds.X + 11, bounds.Y + 6, bounds.X + 18, bounds.Y + 6);
-            graphics.DrawEllipse(pen, bounds.X + 14, bounds.Y + 12, 10, 10);
-            graphics.DrawLine(pen, bounds.X + 25, bounds.Y + 12, bounds.X + 28, bounds.Y + 10);
-        }
-
-        private int GetHintChipWidth(string key, string label) =>
-            TextRenderer.MeasureText(key, _emptyHintFont).Width + 16
-            + 6 + TextRenderer.MeasureText(label, _emptyBodyFont).Width;
-
-        private void DrawHintChip(Graphics graphics, int y, int x, string key, string label)
-        {
-            int keyWidth = TextRenderer.MeasureText(key, _emptyHintFont).Width + 16;
-            int labelWidth = TextRenderer.MeasureText(label, _emptyBodyFont).Width;
-            var keyBounds = new Rectangle(x, y + 1, keyWidth, 22);
-            using (var fill = new SolidBrush(Theme.Bg))
-                graphics.FillRectangle(fill, keyBounds);
-            using (var border = new Pen(Theme.Border))
-                graphics.DrawRectangle(border, keyBounds);
-            TextRenderer.DrawText(graphics, key, _emptyHintFont, keyBounds, Theme.Text,
-                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
-            var labelBounds = new Rectangle(keyBounds.Right + 6, y, labelWidth + 1, 24);
-            TextRenderer.DrawText(graphics, label, _emptyBodyFont, labelBounds, Theme.Muted,
-                TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
+            TextRenderer.DrawText(graphics, "No capture open. Capture an image to begin.",
+                _emptyLineFont, new Rectangle(card.X + 16, card.Y, card.Width - 32, card.Height),
+                Theme.Muted, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
         }
 
         private void DrawZoomBadge(Graphics graphics)
@@ -3141,8 +3315,7 @@ public sealed class MainForm : Form
             graphics.InterpolationMode = InterpolationMode.NearestNeighbor;
             graphics.PixelOffsetMode = PixelOffsetMode.Half;
             graphics.DrawImage(Frame, zoomedImage);
-            foreach (ScreenPin pin in Pins)
-                DrawPin(graphics, pin, zoomScale, zoomedImage);
+            DrawPins(graphics, zoomScale, zoomedImage, lensBounds, cacheChipBounds: false);
             graphics.Restore(state);
 
             graphics.SmoothingMode = SmoothingMode.AntiAlias;
@@ -3161,13 +3334,59 @@ public sealed class MainForm : Form
             graphics.FillEllipse(center, _mousePosition.X - 2, _mousePosition.Y - 2, 4, 4);
         }
 
-        private void DrawPin(Graphics graphics, ScreenPin pin, float scale, RectangleF imageRectangle)
+        private void DrawPins(
+            Graphics graphics,
+            float scale,
+            RectangleF imageRectangle,
+            Rectangle clipBounds,
+            bool cacheChipBounds)
         {
-            float x = imageRectangle.Left + (pin.X + 0.5f) * scale;
-            float y = imageRectangle.Top + (pin.Y + 0.5f) * scale;
+            var usedChipBounds = new List<Rectangle>();
+            var chips = new Dictionary<ScreenPin, Rectangle>();
+            foreach (ScreenPin pin in Pins
+                         .OrderBy(pin => imageRectangle.Top + (pin.Y + 0.5f) * scale)
+                         .ThenBy(pin => pin.X))
+            {
+                float x = imageRectangle.Left + (pin.X + 0.5f) * scale;
+                float y = imageRectangle.Top + (pin.Y + 0.5f) * scale;
+                Rectangle chip = GetPinLabelBounds(pin, x, y, scale, clipBounds);
+                int originalY = chip.Y;
+                while (usedChipBounds.Any(existing => existing.IntersectsWith(chip))
+                    && chip.Bottom + 18 <= clipBounds.Bottom)
+                    chip.Y += 18;
+
+                if (usedChipBounds.Any(existing => existing.IntersectsWith(chip)))
+                {
+                    chip.Y = originalY;
+                    while (usedChipBounds.Any(existing => existing.IntersectsWith(chip))
+                        && chip.Y - 18 >= clipBounds.Top)
+                        chip.Y -= 18;
+                }
+
+                usedChipBounds.Add(chip);
+                chips[pin] = chip;
+            }
+
+            if (cacheChipBounds)
+            {
+                _pinChipBounds.Clear();
+                foreach ((ScreenPin pin, Rectangle bounds) in chips)
+                    _pinChipBounds[pin] = bounds;
+            }
+
+            foreach (ScreenPin pin in Pins)
+            {
+                float x = imageRectangle.Left + (pin.X + 0.5f) * scale;
+                float y = imageRectangle.Top + (pin.Y + 0.5f) * scale;
+                DrawPin(graphics, pin, scale, x, y, chips[pin]);
+            }
+        }
+
+        private void DrawPin(Graphics graphics, ScreenPin pin, float scale, float x, float y, Rectangle label)
+        {
             float radius = Math.Max(5f, Math.Min(10f, 8f / Math.Max(scale, 0.15f)));
             bool hovered = ReferenceEquals(pin, _hoveredPin);
-            Color color = pin.Confirming ? Theme.Success : Theme.Text;
+            Color color = pin.Confirming ? Theme.Accent : Theme.Text;
             graphics.SmoothingMode = SmoothingMode.AntiAlias;
             using (var glow = new SolidBrush(Color.FromArgb(hovered ? 100 : 55, color)))
                 graphics.FillEllipse(glow, x - radius * 2.2f, y - radius * 2.2f, radius * 4.4f, radius * 4.4f);
@@ -3189,7 +3408,6 @@ public sealed class MainForm : Form
                     (radius + 4) * 2, (radius + 4) * 2);
             }
 
-            Rectangle label = GetPinLabelBounds(pin, x, y);
             using var labelBackground = new SolidBrush(Color.FromArgb(230, 18, 21, 28));
             using var labelBorder = new Pen(hovered ? Theme.Accent : Theme.Border, 1f);
             graphics.FillRectangle(labelBackground, label);
@@ -3198,20 +3416,29 @@ public sealed class MainForm : Form
                 label, Color.White, TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis);
         }
 
-        private Rectangle GetPinLabelBounds(ScreenPin pin, float x, float y)
+        private Rectangle GetPinLabelBounds(
+            ScreenPin pin,
+            float x,
+            float y,
+            float scale,
+            Rectangle clipBounds)
         {
             string label = pin.Zone ?? "unassigned";
-            int width = Math.Clamp(TextRenderer.MeasureText(label, _pinLabelFont).Width + 12, 48, 130);
-            return new Rectangle((int)x + 10, (int)y - 11, width, 19);
+            int width = Math.Clamp(TextRenderer.MeasureText(label, _pinLabelFont).Width + 12,
+                Math.Min(48, clipBounds.Width), Math.Min(130, clipBounds.Width));
+            float radius = Math.Max(5f, Math.Min(10f, 8f / Math.Max(scale, 0.15f)));
+            int left = (int)Math.Round(x + 8f * scale);
+            int top = (int)Math.Round(y - radius - 8f - 18f);
+            left = Math.Clamp(left, clipBounds.Left, clipBounds.Right - width);
+            top = Math.Clamp(top, clipBounds.Top, clipBounds.Bottom - 18);
+            return new Rectangle(left, top, width, 18);
         }
 
         private bool IsOnZoneChip(ScreenPin pin, Point clientPoint)
         {
             if (Frame is null || _imageRectangle.Width <= 0) return false;
-            float scale = _imageRectangle.Width / Frame.Width;
-            float x = _imageRectangle.Left + (pin.X + 0.5f) * scale;
-            float y = _imageRectangle.Top + (pin.Y + 0.5f) * scale;
-            return GetPinLabelBounds(pin, x, y).Contains(clientPoint);
+            return _pinChipBounds.TryGetValue(pin, out Rectangle bounds)
+                && bounds.Contains(clientPoint);
         }
 
         protected override void OnMouseDown(MouseEventArgs e)
@@ -3567,11 +3794,8 @@ public sealed class MainForm : Form
         {
             if (disposing)
             {
-                _emptyTitleFont.Dispose();
-                _emptyBodyFont.Dispose();
-                _emptyHintFont.Dispose();
+                _emptyLineFont.Dispose();
                 _dimensionFont.Dispose();
-                _instructionFont.Dispose();
                 _zoomFont.Dispose();
                 _pinLabelFont.Dispose();
             }
@@ -3594,10 +3818,15 @@ internal enum RoundedButtonIcon
     None,
     Folder,
     Refresh,
+    Settings,
+    Library,
+    Sidebar,
+    SidebarExpand,
 }
 
 internal sealed class RoundedButton : Button
 {
+    private static readonly Font SubLabelFont = new("Consolas", 8.25f);
     private bool _hovered;
     private bool _pressed;
     private bool _focused;
@@ -3605,6 +3834,9 @@ internal sealed class RoundedButton : Button
     private bool _quiet;
     private bool _selected;
     private string? _keyChipText;
+    private string? _subLabel;
+    private Color _subLabelColor = Theme.Muted;
+    private string? _trailingHint;
     private RoundedButtonIcon _icon;
 
     public bool Accent
@@ -3647,6 +3879,39 @@ internal sealed class RoundedButton : Button
         {
             if (_keyChipText == value) return;
             _keyChipText = value;
+            Invalidate();
+        }
+    }
+
+    public string? SubLabel
+    {
+        get => _subLabel;
+        set
+        {
+            if (_subLabel == value) return;
+            _subLabel = value;
+            Invalidate();
+        }
+    }
+
+    public Color SubLabelColor
+    {
+        get => _subLabelColor;
+        set
+        {
+            if (_subLabelColor == value) return;
+            _subLabelColor = value;
+            Invalidate();
+        }
+    }
+
+    public string? TrailingHint
+    {
+        get => _trailingHint;
+        set
+        {
+            if (_trailingHint == value) return;
+            _trailingHint = value;
             Invalidate();
         }
     }
@@ -3743,9 +4008,7 @@ internal sealed class RoundedButton : Button
                 : Selected ? Theme.PanelHi
                 : parentColor;
         bool drawBorder = !Quiet || Selected || _focused;
-        Color edge = _focused
-            ? Accent ? ControlPaint.Light(Theme.Accent, 0.3f) : Theme.Muted
-            : Selected ? Theme.Muted : Theme.Border;
+        Color edge = _focused || Accent || Selected ? Theme.Accent : Theme.Border;
 
         using (var path = CreateRectanglePath(bounds))
         {
@@ -3761,18 +4024,43 @@ internal sealed class RoundedButton : Button
         Color textColor = !Enabled ? Theme.Muted : Accent ? Color.White : Quiet ? Theme.Muted : ForeColor;
         if (!string.IsNullOrEmpty(KeyChipText))
         {
-            var chipBounds = new Rectangle(12, Math.Max(0, (Height - 18) / 2), 18, 18);
-            using (var chipFill = new SolidBrush(Theme.Bg))
-                graphics.FillRectangle(chipFill, chipBounds);
-            using (var chipBorder = new Pen(Theme.Border, 1))
-                graphics.DrawRectangle(chipBorder, chipBounds);
+            var chipBounds = new Rectangle(10, Math.Max(0, (Height - 18) / 2), 18, 18);
+            using (var chipPath = CreateRoundedRectanglePath(chipBounds, 4))
+            using (var chipFill = new SolidBrush(Theme.Border))
+                graphics.FillPath(chipFill, chipPath);
             using var chipFont = new Font("Consolas", KeyChipText.Length > 3 ? 5.5f : 7f);
             TextRenderer.DrawText(graphics, KeyChipText, chipFont, chipBounds, Theme.Text,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
-            var labelBounds = new Rectangle(chipBounds.Right + 8, 0,
-                Math.Max(0, Width - chipBounds.Right - 20), Height);
+            if (!string.IsNullOrEmpty(SubLabel))
+            {
+                var nameBounds = new Rectangle(chipBounds.Right + 8, 2,
+                    Math.Max(0, Width - chipBounds.Right - 18), 17);
+                var subLabelBounds = new Rectangle(nameBounds.X, 19, nameBounds.Width, 14);
+                TextRenderer.DrawText(graphics, Text, Font, nameBounds, textColor,
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
+                TextRenderer.DrawText(graphics, SubLabel, SubLabelFont, subLabelBounds,
+                    Enabled ? SubLabelColor : Theme.Muted,
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            }
+            else
+            {
+                var labelBounds = new Rectangle(chipBounds.Right + 8, 0,
+                    Math.Max(0, Width - chipBounds.Right - 18), Height);
+                TextRenderer.DrawText(graphics, Text, Font, labelBounds, textColor,
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
+            }
+        }
+        else if (!string.IsNullOrEmpty(TrailingHint))
+        {
+            var labelBounds = new Rectangle(12, 0, Math.Max(0, Width - 24), Height);
+            using var hintFont = new Font("Segoe UI", 8.25f);
+            int hintWidth = TextRenderer.MeasureText(TrailingHint, hintFont).Width;
             TextRenderer.DrawText(graphics, Text, Font, labelBounds, textColor,
-                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
+            TextRenderer.DrawText(graphics, TrailingHint, hintFont,
+                new Rectangle(Math.Max(12, Width - hintWidth - 12), 0, Math.Min(hintWidth, Width - 24), Height),
+                Color.FromArgb(190, 255, 255, 255),
+                TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
         }
         else
         {
@@ -3825,12 +4113,53 @@ internal sealed class RoundedButton : Button
                 new Point(bounds.Left + 5, bounds.Top + 7),
             });
         }
+        else if (icon == RoundedButtonIcon.Settings)
+        {
+            graphics.DrawEllipse(pen, bounds.Left + 4, bounds.Top + 4, 8, 8);
+            graphics.DrawEllipse(pen, bounds.Left + 7, bounds.Top + 7, 2, 2);
+            graphics.DrawLine(pen, bounds.Left + 8, bounds.Top + 1, bounds.Left + 8, bounds.Top + 4);
+            graphics.DrawLine(pen, bounds.Left + 8, bounds.Bottom - 4, bounds.Left + 8, bounds.Bottom - 1);
+            graphics.DrawLine(pen, bounds.Left + 1, bounds.Top + 8, bounds.Left + 4, bounds.Top + 8);
+            graphics.DrawLine(pen, bounds.Right - 4, bounds.Top + 8, bounds.Right - 1, bounds.Top + 8);
+        }
+        else if (icon == RoundedButtonIcon.Library)
+        {
+            graphics.DrawRectangle(pen, bounds.Left + 2, bounds.Top + 3, 5, 11);
+            graphics.DrawRectangle(pen, bounds.Left + 9, bounds.Top + 3, 5, 11);
+            graphics.DrawLine(pen, bounds.Left + 7, bounds.Top + 4, bounds.Left + 7, bounds.Bottom - 2);
+            graphics.DrawLine(pen, bounds.Left + 9, bounds.Top + 4, bounds.Left + 9, bounds.Bottom - 2);
+        }
+        else if (icon is RoundedButtonIcon.Sidebar or RoundedButtonIcon.SidebarExpand)
+        {
+            graphics.DrawRectangle(pen, bounds.Left + 2, bounds.Top + 2, 12, 12);
+            graphics.DrawLine(pen, bounds.Left + 6, bounds.Top + 2, bounds.Left + 6, bounds.Bottom - 2);
+            if (icon == RoundedButtonIcon.SidebarExpand)
+            {
+                graphics.DrawLine(pen, bounds.Left + 8, bounds.Top + 6, bounds.Left + 11, bounds.Top + 8);
+                graphics.DrawLine(pen, bounds.Left + 11, bounds.Top + 8, bounds.Left + 8, bounds.Top + 10);
+            }
+        }
     }
 
     internal static GraphicsPath CreateRectanglePath(Rectangle bounds)
     {
+        return CreateRoundedRectanglePath(bounds, 6);
+    }
+
+    internal static GraphicsPath CreateRoundedRectanglePath(Rectangle bounds, int radius)
+    {
         var path = new GraphicsPath();
-        path.AddRectangle(bounds);
+        int diameter = Math.Min(radius * 2, Math.Min(bounds.Width, bounds.Height));
+        if (diameter <= 0)
+        {
+            path.AddRectangle(bounds);
+            return path;
+        }
+        path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180, 90);
+        path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270, 90);
+        path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
+        path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
+        path.CloseFigure();
         return path;
     }
 }

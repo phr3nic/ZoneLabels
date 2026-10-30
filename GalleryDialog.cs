@@ -12,9 +12,9 @@ internal sealed class GalleryDialog : Form
     }
 
     private readonly List<string> _files;
-    private readonly string[] _captureDirectories;
     private readonly string _doneDirectory;
     private readonly string _dataDirectory;
+    private readonly DatasetManifestStore _manifestStore;
     private readonly Dictionary<CaptureSection, List<string>> _sectionFiles = new();
     private readonly Dictionary<CaptureSection, ListBox> _captureLists = new();
     private readonly Dictionary<CaptureSection, Label> _emptyMessages = new();
@@ -30,11 +30,11 @@ internal sealed class GalleryDialog : Form
 
     public string? SelectedCapturePath { get; private set; }
 
-    public GalleryDialog(IEnumerable<string> captureDirectories, string doneDirectory, string dataDirectory)
+    public GalleryDialog(string doneDirectory, string dataDirectory, DatasetManifestStore manifestStore)
     {
-        _captureDirectories = captureDirectories.ToArray();
         _doneDirectory = doneDirectory;
         _dataDirectory = dataDirectory;
+        _manifestStore = manifestStore;
         _files = GetCaptureFiles();
 
         Text = "Capture library";
@@ -251,7 +251,7 @@ internal sealed class GalleryDialog : Form
         _deleteButton.Enabled = hasSelection;
         _doneButton.Enabled = hasSelection
             && !IsDataCrop(selectedPath!)
-            && !CaptureFileOperations.IsCompleted(selectedPath!, _doneDirectory);
+            && _manifestStore.GetStatus(selectedPath!) == "todo";
         _deleteButton.Enabled = hasSelection && !IsDataCrop(selectedPath!);
     }
 
@@ -285,10 +285,13 @@ internal sealed class GalleryDialog : Form
     };
 
     private List<string> GetCaptureFiles() =>
-        _captureDirectories.Append(_dataDirectory)
-            .Where(Directory.Exists)
-            .SelectMany(directory => Directory.GetFiles(directory, "*", SearchOption.TopDirectoryOnly))
-            .Where(CaptureFileOperations.IsSupportedImageFile)
+        _manifestStore.Manifest.Captures
+            .Select(entry => _manifestStore.ResolveFile(entry.File))
+            .Concat(Directory.Exists(_dataDirectory)
+                ? Directory.GetFiles(_dataDirectory, "*", SearchOption.TopDirectoryOnly)
+                    .Where(CaptureFileOperations.IsSupportedImageFile)
+                : Enumerable.Empty<string>())
+            .Where(File.Exists)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .OrderBy(CaptureFileOperations.GetCaptureTimeUtc)
             .ThenBy(Path.GetFileName, StringComparer.OrdinalIgnoreCase)
@@ -339,9 +342,12 @@ internal sealed class GalleryDialog : Form
     {
         if (IsDataCrop(imagePath))
             return CaptureSection.DoneData;
-        if (CaptureFileOperations.IsCompleted(imagePath, _doneDirectory))
+        string status = _manifestStore.GetStatus(imagePath);
+        if (status is "done" or "skipped")
             return CaptureSection.DoneData;
-        return HasSavedPins(imagePath) ? CaptureSection.SavedEditing : CaptureSection.Todo;
+        return _manifestStore.FindCapture(imagePath)?.Pins.Count > 0
+            ? CaptureSection.SavedEditing
+            : CaptureSection.Todo;
     }
 
     private bool IsDataCrop(string imagePath) =>
@@ -349,24 +355,6 @@ internal sealed class GalleryDialog : Form
             Path.GetFullPath(Path.GetDirectoryName(imagePath) ?? string.Empty),
             Path.GetFullPath(_dataDirectory),
             StringComparison.OrdinalIgnoreCase);
-
-    private static bool HasSavedPins(string imagePath)
-    {
-        string statePath = Path.ChangeExtension(imagePath, ".json");
-        if (!File.Exists(statePath)) return false;
-        try
-        {
-            GalleryCapture? capture = JsonSerializer.Deserialize<GalleryCapture>(
-                File.ReadAllText(statePath),
-                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
-            return capture?.Pins is { Count: > 0 };
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or InvalidDataException)
-        {
-            Log.Error($"reading capture library state failed: {statePath}", ex);
-            return true;
-        }
-    }
 
     private string? GetSelectedFile()
     {
@@ -379,19 +367,19 @@ internal sealed class GalleryDialog : Form
     private void MarkSelectedDone()
     {
         string? imagePath = GetSelectedFile();
-        if (imagePath is null || CaptureFileOperations.IsCompleted(imagePath, _doneDirectory))
+        if (imagePath is null || _manifestStore.GetStatus(imagePath) != "todo")
             return;
 
         try
         {
-            if (!CaptureFileOperations.IsReadyForCompletion(imagePath, out string reason))
+            if (!CaptureFileOperations.IsReadyForCompletion(imagePath, _manifestStore, out string reason))
             {
                 MessageBox.Show(this, reason, "Capture is not ready",
                     MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
 
-            string completedPath = CaptureFileOperations.MoveToDone(imagePath, _doneDirectory);
+            string completedPath = _manifestStore.MoveToDone(imagePath, _doneDirectory);
             RefreshCaptureFiles(completedPath);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException or JsonException)
@@ -438,6 +426,16 @@ internal sealed class GalleryDialog : Form
             metadataWarning = $"The capture image was deleted, but its pin data could not be deleted:\n{ex.Message}";
         }
 
+        try
+        {
+            _manifestStore.RemoveCapture(imagePath);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException)
+        {
+            Log.Error($"removing capture from manifest failed: {imagePath}", ex);
+            metadataWarning = $"The files were deleted, but manifest.json could not be updated:\n{ex.Message}";
+        }
+
         RefreshCaptureFiles(null);
         if (metadataWarning is not null)
             MessageBox.Show(this, metadataWarning, "Capture partially deleted",
@@ -460,8 +458,10 @@ internal sealed class GalleryDialog : Form
         DateTime created = CaptureFileOperations.GetCaptureTimeUtc(path).ToLocalTime();
         string state = IsDataCrop(path)
             ? "EXPORTED DATA CROP"
-            : CaptureFileOperations.IsCompleted(path, _doneDirectory)
+            : _manifestStore.GetStatus(path) == "done"
             ? "DONE / DATA"
+            : _manifestStore.GetStatus(path) == "skipped"
+                ? "SKIPPED"
             : GetSection(path) == CaptureSection.SavedEditing
                 ? "SAVED / EDITING"
                 : "TODO";

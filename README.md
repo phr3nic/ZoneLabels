@@ -41,7 +41,7 @@ dotnet publish .\ZoneLab.csproj -c Release -r win-x64 --self-contained true -o .
 - Images in `dataset/data` can also be opened and edited; their pin progress is stored beside the crop. Dataset crops remain in `dataset/data` and cannot be deleted or marked done from the capture library.
 - **Discard** arms a 2-second confirmation; press the button or configured key again to discard. Double-click the button to discard immediately. **Ctrl+Z** undoes the last placed pin; **Ctrl+Shift+Z** redoes it.
 - Hover and drag a pin to reposition it. Click its zone chip to relabel it. Hold the configured precision key (default **LeftShift**) over the canvas to slow aim-marker movement.
-- The strip along the bottom shows `zone count/target`, based on rows in `dataset/labels.csv`. **Refresh counts** rereads the CSV.
+- The label count rows use pin labels in `dataset/manifest.json`. **Refresh counts** rereads the manifest.
 
 ## Settings reference
 
@@ -55,7 +55,7 @@ dotnet publish .\ZoneLab.csproj -c Release -r win-x64 --self-contained true -o .
 | `alwaysOnTop` | `false` | Keep the main window above other windows. |
 | `hideWhileCapturing` | `false` | Hide the app briefly while capturing the display. |
 | `doneRetentionDays` | `7` | Age in days after which files in `dataset/done` are purged at startup. |
-| `targetCounts` | `head: 500`, `chest: 500`, `body: 500`, `arms: 500`, `legs: 500`, `none: 500` | Per-zone goals shown in the bottom count strip and editable in Settings. |
+| `targetCounts` | `head: 500`, `chest: 500`, `body: 500`, `arms: 500`, `legs: 500`, `none: 500` | Per-zone goals shown in the sidebar and zone buttons, editable in Settings. |
 | `minPinSpacing` | `40` | Minimum pin separation in source-image pixels for the warning. It does not block exports. |
 | `precisionKey` | `"LeftShift"` | Modifier held over the canvas to slow aim-marker movement. |
 | `precisionFactor` | `0.25` | Aim-marker movement multiplier while the precision key is held. |
@@ -63,6 +63,7 @@ dotnet publish .\ZoneLab.csproj -c Release -r win-x64 --self-contained true -o .
 | `windowY` | `null` | Saved window top position in screen pixels. `null` uses the centered default. |
 | `windowWidth` | `null` | Saved window width in screen pixels. `null` uses the default size. |
 | `windowHeight` | `null` | Saved window height in screen pixels. `null` uses the default size. |
+| `sidebarCollapsed` | `null` | Persisted sidebar state. When unset, the sidebar starts collapsed below 1280px. |
 
 `doneRetentionDays` must be between 0 and 3650; `minPinSpacing` must be between 0 and 10000. Target counts must be non-negative integers. Crop output is fixed at 96 × 96 pixels.
 
@@ -72,11 +73,16 @@ The same shortcut format applies to `discardKey` and each zone's `key`; those sh
 
 | Path | Contents |
 |---|---|
-| `dataset/todo/` | Captured images and JSON pin state waiting to be labelled. |
-| `dataset/done/` | Completed captures and their JSON pin state; old files are removed by the retention setting. |
+| `dataset/todo/` | Images waiting to be labelled and their optional legacy JSON pin state. |
+| `dataset/done/` | Completed images and their optional legacy JSON pin state; old files are removed by the retention setting. |
 | `dataset/data/` | Exported 96 × 96 PNG crops. |
-| `dataset/labels.csv` | Crop filename, zone, crop dimensions, and source-screen coordinates. |
+| `dataset/manifest.json` | Portable source of truth for capture paths, statuses, pin positions and zones. |
+| `dataset/labels.csv` | Export artifact containing crop filenames, zones, crop dimensions, and source-screen coordinates. |
 | `dataset/capture.log` | Application errors and done-purge counts. |
+
+On first launch, captures in the existing `todo`, `done`, and legacy `gallery` folders are migrated into `manifest.json` without moving their files. Thereafter, capture status and pins are read from the manifest; the folders only organize image files. Manifest updates use a temporary file and atomic replacement, keeping the five most recent `manifest.json.bak.*` backups.
+
+To check a dataset from a terminal, run `ZoneLabels.exe --validate-manifest [dataset-folder]`. If the folder is omitted, the app's default dataset is checked. The command also performs the first-run migration when needed.
 
 The application does not purge `dataset/data` or modify existing rows in `dataset/labels.csv`.
 

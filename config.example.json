@@ -44,5 +44,6 @@
   "windowX": null,
   "windowY": null,
   "windowWidth": null,
-  "windowHeight": null
+  "windowHeight": null,
+  "sidebarCollapsed": null
 }

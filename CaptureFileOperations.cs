@@ -13,51 +13,6 @@ internal static class CaptureFileOperations
             || string.Equals(extension, ".jpeg", StringComparison.OrdinalIgnoreCase);
     }
 
-    public static int? PurgeDone(string doneDirectory, int retentionDays)
-    {
-        if (!Directory.Exists(doneDirectory))
-            return null;
-
-        DateTime cutoff = DateTime.UtcNow.AddDays(-retentionDays);
-        string[] files = Directory.GetFiles(doneDirectory, "*", SearchOption.TopDirectoryOnly);
-        int removed = 0;
-        foreach (string file in files)
-        {
-            if (string.Equals(Path.GetExtension(file), ".json", StringComparison.OrdinalIgnoreCase)
-                || !File.Exists(file)
-                || File.GetLastWriteTimeUtc(file) >= cutoff)
-                continue;
-
-            File.Delete(file);
-            removed++;
-            string sidecar = Path.ChangeExtension(file, ".json");
-            if (File.Exists(sidecar))
-            {
-                File.Delete(sidecar);
-                removed++;
-            }
-        }
-
-        foreach (string file in files)
-        {
-            if (!string.Equals(Path.GetExtension(file), ".json", StringComparison.OrdinalIgnoreCase)
-                || !File.Exists(file)
-                || File.GetLastWriteTimeUtc(file) >= cutoff)
-                continue;
-
-            File.Delete(file);
-            removed++;
-        }
-
-        return removed;
-    }
-
-    public static bool IsCompleted(string imagePath, string doneDirectory) =>
-        string.Equals(
-            Path.GetFullPath(Path.GetDirectoryName(imagePath) ?? string.Empty),
-            Path.GetFullPath(doneDirectory),
-            StringComparison.OrdinalIgnoreCase);
-
     public static DateTime GetCaptureTimeUtc(string imagePath)
     {
         string fileName = Path.GetFileNameWithoutExtension(imagePath);
@@ -70,8 +25,15 @@ internal static class CaptureFileOperations
         return File.GetLastWriteTimeUtc(imagePath);
     }
 
-    public static bool IsReadyForCompletion(string imagePath, out string reason)
+    public static bool IsReadyForCompletion(
+        string imagePath,
+        DatasetManifestStore manifestStore,
+        out string reason)
     {
+        DatasetCaptureEntry? manifestEntry = manifestStore.FindCapture(imagePath);
+        if (manifestEntry is null)
+            throw new InvalidDataException("This capture is not present in manifest.json.");
+
         string statePath = Path.ChangeExtension(imagePath, ".json");
         if (!File.Exists(statePath))
         {
@@ -84,13 +46,18 @@ internal static class CaptureFileOperations
             new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
             ?? throw new InvalidDataException("The capture pin data is empty or invalid.");
 
-        if (capture.Pins is null || capture.Pins.Count == 0)
+        if (manifestEntry.Pins.Count == 0)
         {
             reason = "Add at least one labeled pin before marking this capture done.";
             return false;
         }
 
-        if (capture.Pins.Any(pin => string.IsNullOrWhiteSpace(pin.Zone) || !pin.Exported))
+        var exportedPins = capture.Pins
+            .Where(pin => pin.Exported)
+            .Select(pin => (pin.X, pin.Y, pin.Zone))
+            .ToHashSet();
+        if (manifestEntry.Pins.Any(pin => string.IsNullOrWhiteSpace(pin.Zone)
+                || !exportedPins.Contains((pin.X, pin.Y, pin.Zone))))
         {
             reason = "Finish labeling and save every pin before marking this capture done.";
             return false;
@@ -103,8 +70,6 @@ internal static class CaptureFileOperations
     public static string MoveToDone(string imagePath, string doneDirectory)
     {
         string sourceImage = Path.GetFullPath(imagePath);
-        if (IsCompleted(sourceImage, doneDirectory))
-            return sourceImage;
         if (!File.Exists(sourceImage))
             throw new FileNotFoundException("The capture image no longer exists.", sourceImage);
 

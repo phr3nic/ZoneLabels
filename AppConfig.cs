@@ -19,6 +19,7 @@ internal sealed class AppConfig
     public int? WindowY { get; set; }
     public int? WindowWidth { get; set; }
     public int? WindowHeight { get; set; }
+    public bool? SidebarCollapsed { get; set; }
 
     public static AppConfig CreateDefault() => new();
 
@@ -38,6 +39,7 @@ internal sealed class AppConfig
         WindowY = WindowY,
         WindowWidth = WindowWidth,
         WindowHeight = WindowHeight,
+        SidebarCollapsed = SidebarCollapsed,
     };
 
     public static AppConfig Load(string path)

@@ -15,13 +15,16 @@ internal static class Log
 
     public static string FilePath { get; } = Path.Combine(Directory, "capture.log");
 
-    public static void Info(string message) => Write("INFO", message, null);
+    public static void Info(string message) => Write(Directory, "INFO", message, null);
 
-    public static void Error(string message, Exception? ex = null) => Write("ERR ", message, ex);
+    public static void Error(string message, Exception? ex = null) => Write(Directory, "ERR ", message, ex);
 
-    public static void Fatal(Exception? ex) => Write("FATAL", "unhandled exception", ex);
+    public static void ErrorAt(string datasetDirectory, string message, Exception? ex = null) =>
+        Write(datasetDirectory, "ERR ", message, ex);
 
-    private static void Write(string level, string message, Exception? ex)
+    public static void Fatal(Exception? ex) => Write(Directory, "FATAL", "unhandled exception", ex);
+
+    private static void Write(string datasetDirectory, string level, string message, Exception? ex)
     {
         var line = new StringBuilder()
             .Append(DateTime.Now.ToString("HH:mm:ss.fff"))
@@ -34,8 +37,8 @@ internal static class Log
         {
             lock (Gate)
             {
-                System.IO.Directory.CreateDirectory(Directory);
-                File.AppendAllText(FilePath, line + Environment.NewLine);
+                System.IO.Directory.CreateDirectory(datasetDirectory);
+                File.AppendAllText(Path.Combine(datasetDirectory, "capture.log"), line + Environment.NewLine);
             }
         }
         catch { }

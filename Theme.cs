@@ -17,15 +17,15 @@ internal static class Theme
     public static readonly Color Bg = Color.FromArgb(0x0B, 0x0D, 0x12);
     public static readonly Color BgDeep = Color.FromArgb(0x0B, 0x0D, 0x12);
     public static readonly Color Panel = Color.FromArgb(0x12, 0x15, 0x1C);
-    public static readonly Color PanelHi = Color.FromArgb(0x1A, 0x1F, 0x2A);
+    public static readonly Color PanelHi = Color.FromArgb(0x17, 0x1A, 0x22);
     public static readonly Color PanelTop = Color.FromArgb(0x12, 0x15, 0x1C);
     public static readonly Color Border = Color.FromArgb(0x24, 0x2A, 0x3A);
     public static readonly Color BorderSoft = Color.FromArgb(0x24, 0x2A, 0x3A);
     public static readonly Color Text = Color.FromArgb(0xE6, 0xE9, 0xF0);
     public static readonly Color Muted = Color.FromArgb(0x8A, 0x93, 0xA6);
-    public static readonly Color Accent = Color.FromArgb(0x6C, 0x6C, 0xF0);
+    public static readonly Color Accent = Color.FromArgb(0x6C, 0x5C, 0xE7);
     public static readonly Color Success = Color.FromArgb(0x46, 0xD6, 0x9A);
-    public static readonly Color Warn = Color.FromArgb(0xF0, 0x8C, 0x6C);
+    public static readonly Color Warn = Color.FromArgb(0xE4, 0xA8, 0x4C);
 
     public static Control CreateDialogTitleBar(Form form, string title)
     {
