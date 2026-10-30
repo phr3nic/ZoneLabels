@@ -1,96 +1,88 @@
+using System.Text.Json;
+
 namespace ZoneLab;
 
 internal sealed class GalleryDialog : Form
 {
-    private readonly ListBox _captures;
+    private enum CaptureSection
+    {
+        DoneData,
+        Todo,
+        SavedEditing,
+    }
+
     private readonly List<string> _files;
     private readonly string[] _captureDirectories;
     private readonly string _doneDirectory;
-    private readonly Label _emptyMessage;
+    private readonly string _dataDirectory;
+    private readonly Dictionary<CaptureSection, List<string>> _sectionFiles = new();
+    private readonly Dictionary<CaptureSection, ListBox> _captureLists = new();
+    private readonly Dictionary<CaptureSection, Label> _emptyMessages = new();
+    private readonly Dictionary<CaptureSection, RoundedButton> _sectionButtons = new();
+    private readonly Dictionary<CaptureSection, Control> _sectionSurfaces = new();
+    private readonly Panel _sectionHost;
     private readonly Label _heading;
+    private readonly RoundedButton _openButton;
+    private readonly RoundedButton _deleteButton;
+    private readonly RoundedButton _doneButton;
+    private CaptureSection _activeSection = CaptureSection.Todo;
+    private ListBox _captures = null!;
 
     public string? SelectedCapturePath { get; private set; }
 
-    public GalleryDialog(IEnumerable<string> captureDirectories, string doneDirectory)
+    public GalleryDialog(IEnumerable<string> captureDirectories, string doneDirectory, string dataDirectory)
     {
         _captureDirectories = captureDirectories.ToArray();
         _doneDirectory = doneDirectory;
+        _dataDirectory = dataDirectory;
         _files = GetCaptureFiles();
 
         Text = "Capture library";
         BackColor = Theme.Bg;
         ForeColor = Theme.Text;
         Font = new Font("Segoe UI", 9f);
-        ClientSize = new Size(560, 500);
-        MinimumSize = new Size(480, 380);
+        ClientSize = new Size(640, 560);
+        MinimumSize = new Size(520, 420);
         StartPosition = FormStartPosition.CenterParent;
         FormBorderStyle = FormBorderStyle.None;
         MinimizeBox = false;
         MaximizeBox = false;
 
-        _captures = new ListBox
+        _heading = new Label
         {
             Dock = DockStyle.Fill,
-            BackColor = Theme.BgDeep,
-            ForeColor = Theme.Text,
-            BorderStyle = BorderStyle.FixedSingle,
-            Font = new Font("Segoe UI", 9.5f),
-            IntegralHeight = false,
-            DrawMode = DrawMode.OwnerDrawFixed,
-            ItemHeight = 42,
-        };
-        foreach (string file in _files)
-            _captures.Items.Add(file);
-        if (_captures.Items.Count > 0) _captures.SelectedIndex = 0;
-        _captures.DrawItem += DrawCapture;
-
-        _emptyMessage = new Label
-        {
-            Text = "No captures yet. Use Capture to save a screen to dataset\\todo.",
-            Dock = DockStyle.Fill,
-            TextAlign = ContentAlignment.MiddleCenter,
             ForeColor = Theme.Muted,
-            Visible = _files.Count == 0,
+            Font = new Font("Segoe UI Semibold", 8.25f, FontStyle.Bold),
+            TextAlign = ContentAlignment.MiddleLeft,
+            Margin = Padding.Empty,
         };
-        var open = new RoundedButton
+        var tabs = new FlowLayoutPanel
         {
-            Text = "Open capture",
-            AutoSize = true,
-            BackColor = Theme.Panel,
-            ForeColor = Theme.Text,
-            Padding = new Padding(10, 4, 10, 4),
-            Accent = true,
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Margin = Padding.Empty,
+            Padding = Padding.Empty,
+            BackColor = Theme.Bg,
         };
-        var cancel = new RoundedButton
+        _sectionHost = new Panel
         {
-            Text = "Cancel",
-            AutoSize = true,
-            DialogResult = DialogResult.Cancel,
-            BackColor = Theme.Panel,
-            ForeColor = Theme.Text,
-            Padding = new Padding(10, 4, 10, 4),
-            Quiet = true,
+            Dock = DockStyle.Fill,
+            BackColor = Theme.Bg,
+            Margin = Padding.Empty,
         };
-        var delete = new RoundedButton
-        {
-            Text = "Delete capture",
-            AutoSize = true,
-            BackColor = Theme.Panel,
-            ForeColor = Theme.Warn,
-            Padding = new Padding(10, 4, 10, 4),
-            Quiet = true,
-            Enabled = _files.Count > 0,
-        };
-        var done = new RoundedButton
-        {
-            Text = "Mark done",
-            AutoSize = true,
-            BackColor = Theme.Panel,
-            ForeColor = Theme.Success,
-            Padding = new Padding(10, 4, 10, 4),
-            Accent = true,
-            Enabled = _files.Count > 0,
-        };
+
+        AddSection(CaptureSection.DoneData, "Done / data", tabs);
+        AddSection(CaptureSection.Todo, "Todo", tabs);
+        AddSection(CaptureSection.SavedEditing, "Saved / editing", tabs);
+
+        _openButton = MakeButton("Open capture", accent: true);
+        _deleteButton = MakeButton("Delete capture", quiet: true);
+        _deleteButton.ForeColor = Theme.Warn;
+        _doneButton = MakeButton("Mark done");
+        _doneButton.ForeColor = Theme.Success;
+        var cancelButton = MakeButton("Cancel", quiet: true);
+        cancelButton.DialogResult = DialogResult.Cancel;
 
         var footer = new FlowLayoutPanel
         {
@@ -100,10 +92,10 @@ internal sealed class GalleryDialog : Form
             WrapContents = false,
             Padding = new Padding(0, 8, 0, 0),
         };
-        footer.Controls.Add(open);
-        footer.Controls.Add(cancel);
-        footer.Controls.Add(delete);
-        footer.Controls.Add(done);
+        footer.Controls.Add(_openButton);
+        footer.Controls.Add(cancelButton);
+        footer.Controls.Add(_deleteButton);
+        footer.Controls.Add(_doneButton);
 
         var layout = new TableLayoutPanel
         {
@@ -111,89 +103,283 @@ internal sealed class GalleryDialog : Form
             Padding = new Padding(16),
             BackColor = Theme.Bg,
             ColumnCount = 1,
-            RowCount = 2,
+            RowCount = 3,
+            Margin = Padding.Empty,
         };
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        _heading = new Label
-        {
-            Dock = DockStyle.Fill,
-            ForeColor = Theme.Muted,
-            Font = new Font("Segoe UI Semibold", 9f, FontStyle.Bold),
-            TextAlign = ContentAlignment.MiddleLeft,
-        };
-        UpdateCaptureList();
-        var listSurface = new GlassPanel
-        {
-            Dock = DockStyle.Fill,
-            SurfaceColor = Theme.BgDeep,
-            EdgeColor = Theme.BorderSoft,
-            CornerRadius = 9,
-            Padding = new Padding(4),
-        };
-        listSurface.Controls.Add(_captures);
-        listSurface.Controls.Add(_emptyMessage);
         layout.Controls.Add(_heading, 0, 0);
-        layout.Controls.Add(listSurface, 0, 1);
-        Controls.Add(layout);
-        Controls.Add(footer);
-        Controls.Add(Theme.CreateDialogTitleBar(this, Text));
-        AcceptButton = open;
-        CancelButton = cancel;
+        layout.Controls.Add(tabs, 0, 1);
+        layout.Controls.Add(_sectionHost, 0, 2);
 
-        open.Click += (_, _) =>
+        var dialogSurface = new GlassPanel
         {
-            if (_captures.SelectedIndex < 0)
-            {
-                if (_files.Count == 0) DialogResult = DialogResult.Cancel;
-                else MessageBox.Show(this, "Select a capture first.", "Capture library",
-                    MessageBoxButtons.OK, MessageBoxIcon.Information);
-                return;
-            }
-            SelectedCapturePath = _files[_captures.SelectedIndex];
+            Dock = DockStyle.Fill,
+            SurfaceColor = Theme.Panel,
+            EdgeColor = Theme.Border,
+            Padding = new Padding(1),
+            Margin = Padding.Empty,
+        };
+        dialogSurface.Controls.Add(layout);
+        dialogSurface.Controls.Add(footer);
+        dialogSurface.Controls.Add(Theme.CreateDialogTitleBar(this, Text));
+        Controls.Add(dialogSurface);
+
+        _openButton.Click += (_, _) =>
+        {
+            string? path = GetSelectedFile();
+            if (path is null) return;
+            SelectedCapturePath = path;
             DialogResult = DialogResult.OK;
             Close();
         };
-        _captures.DoubleClick += (_, _) => open.PerformClick();
-        _captures.SelectedIndexChanged += (_, _) =>
+        _deleteButton.Click += (_, _) => DeleteSelectedCapture();
+        _doneButton.Click += (_, _) => MarkSelectedDone();
+        cancelButton.Click += (_, _) => Close();
+        foreach (ListBox list in _captureLists.Values)
         {
-            bool hasSelection = _captures.SelectedIndex >= 0;
-            delete.Enabled = hasSelection;
-            done.Enabled = hasSelection && !CaptureFileOperations.IsCompleted(
-                _files[_captures.SelectedIndex], _doneDirectory);
+            list.SelectedIndexChanged += (_, _) => UpdateActionButtons();
+            list.DoubleClick += (_, _) => _openButton.PerformClick();
+        }
+
+        AcceptButton = _openButton;
+        CancelButton = cancelButton;
+        var toolTips = new ToolTip();
+        ApplyButtonTooltips(this, toolTips);
+        Disposed += (_, _) => toolTips.Dispose();
+
+        RefreshCaptureFiles(null);
+    }
+
+    private void AddSection(CaptureSection section, string title, FlowLayoutPanel tabs)
+    {
+        var button = new RoundedButton
+        {
+            Text = title,
+            AutoSize = false,
+            Width = section == CaptureSection.SavedEditing ? 150 : 120,
+            Height = 32,
+            Margin = new Padding(0, 0, 8, 0),
+            Padding = new Padding(12, 0, 12, 0),
+            BackColor = Theme.Panel,
+            ForeColor = Theme.Text,
         };
-        bool hasInitialSelection = _captures.SelectedIndex >= 0;
-        delete.Enabled = hasInitialSelection;
-        done.Enabled = hasInitialSelection && !CaptureFileOperations.IsCompleted(
-            _files[_captures.SelectedIndex], _doneDirectory);
-        delete.Click += (_, _) => DeleteSelectedCapture();
-        done.Click += (_, _) => MarkSelectedDone();
+        button.Click += (_, _) => SelectSection(section);
+        tabs.Controls.Add(button);
+        _sectionButtons.Add(section, button);
+
+        var list = new ListBox
+        {
+            Dock = DockStyle.Fill,
+            BackColor = Theme.BgDeep,
+            ForeColor = Theme.Text,
+            BorderStyle = BorderStyle.FixedSingle,
+            Font = new Font("Segoe UI", 9f),
+            IntegralHeight = false,
+            DrawMode = DrawMode.OwnerDrawFixed,
+            ItemHeight = 42,
+            Visible = false,
+        };
+        list.DrawItem += DrawCapture;
+        var empty = new Label
+        {
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleCenter,
+            ForeColor = Theme.Muted,
+            BackColor = Theme.BgDeep,
+            Visible = false,
+        };
+        var surface = new GlassPanel
+        {
+            Dock = DockStyle.Fill,
+            SurfaceColor = Theme.BgDeep,
+            EdgeColor = Theme.Border,
+            Padding = new Padding(4),
+            Visible = false,
+        };
+        surface.Controls.Add(list);
+        surface.Controls.Add(empty);
+        _sectionHost.Controls.Add(surface);
+        _sectionFiles.Add(section, new List<string>());
+        _captureLists.Add(section, list);
+        _emptyMessages.Add(section, empty);
+        _sectionSurfaces.Add(section, surface);
+    }
+
+    private void SelectSection(CaptureSection section)
+    {
+        _activeSection = section;
+        _captures = _captureLists[section];
+        foreach (CaptureSection key in _sectionButtons.Keys)
+        {
+            bool selected = key == section;
+            _sectionButtons[key].Selected = selected;
+            Control surface = _sectionSurfaces[key];
+            surface.Visible = selected;
+            if (selected) surface.BringToFront();
+        }
+        UpdateActionButtons();
     }
 
     private void UpdateCaptureList()
     {
-        int doneCount = _files.Count(file => CaptureFileOperations.IsCompleted(file, _doneDirectory));
-        int todoCount = _files.Count - doneCount;
-        _heading.Text = $"CAPTURE LIBRARY     ·     {todoCount} TODO  /  {doneCount} DONE";
-        _emptyMessage.Visible = _files.Count == 0;
+        int doneCount = _sectionFiles[CaptureSection.DoneData].Count;
+        int todoCount = _sectionFiles[CaptureSection.Todo].Count;
+        int savedCount = _sectionFiles[CaptureSection.SavedEditing].Count;
+        _heading.Text = $"Capture library  ·  {doneCount} done / data  ·  {todoCount} todo  ·  {savedCount} saved / editing";
+
+        _sectionButtons[CaptureSection.DoneData].Text = $"Done / data ({doneCount})";
+        _sectionButtons[CaptureSection.Todo].Text = $"Todo ({todoCount})";
+        _sectionButtons[CaptureSection.SavedEditing].Text = $"Saved / editing ({savedCount})";
+        _emptyMessages[CaptureSection.DoneData].Text = "No completed captures.";
+        _emptyMessages[CaptureSection.Todo].Text = "No captures waiting to be labeled.";
+        _emptyMessages[CaptureSection.SavedEditing].Text = "No captures with saved pin progress.";
+        foreach (CaptureSection section in _sectionFiles.Keys)
+        {
+            bool isEmpty = _sectionFiles[section].Count == 0;
+            _emptyMessages[section].Visible = isEmpty;
+            _captureLists[section].Visible = !isEmpty;
+        }
     }
 
+    private void UpdateActionButtons()
+    {
+        string? selectedPath = GetSelectedFile();
+        bool hasSelection = selectedPath is not null;
+        _openButton.Enabled = hasSelection;
+        _deleteButton.Enabled = hasSelection;
+        _doneButton.Enabled = hasSelection
+            && !IsDataCrop(selectedPath!)
+            && !CaptureFileOperations.IsCompleted(selectedPath!, _doneDirectory);
+        _deleteButton.Enabled = hasSelection && !IsDataCrop(selectedPath!);
+    }
+
+    private static void ApplyButtonTooltips(Control parent, ToolTip toolTips)
+    {
+        foreach (Control child in parent.Controls)
+        {
+            if (child is Button button)
+            {
+                string text = string.IsNullOrWhiteSpace(button.AccessibleName)
+                    ? button.Text
+                    : button.AccessibleName;
+                toolTips.SetToolTip(button, string.IsNullOrWhiteSpace(text) ? "Button" : text);
+            }
+            ApplyButtonTooltips(child, toolTips);
+        }
+    }
+
+    private static RoundedButton MakeButton(string text, bool accent = false, bool quiet = false) => new()
+    {
+        Text = text,
+        AutoSize = false,
+        BackColor = Theme.Panel,
+        ForeColor = Theme.Text,
+        Width = TextRenderer.MeasureText(text, SystemFonts.MessageBoxFont).Width + 32,
+        Height = 32,
+        Padding = new Padding(12, 0, 12, 0),
+        Margin = new Padding(0, 0, 8, 0),
+        Accent = accent,
+        Quiet = quiet,
+    };
+
     private List<string> GetCaptureFiles() =>
-        _captureDirectories
+        _captureDirectories.Append(_dataDirectory)
             .Where(Directory.Exists)
-            .SelectMany(directory => Directory.GetFiles(directory, "*.png", SearchOption.TopDirectoryOnly))
+            .SelectMany(directory => Directory.GetFiles(directory, "*", SearchOption.TopDirectoryOnly))
+            .Where(CaptureFileOperations.IsSupportedImageFile)
             .Distinct(StringComparer.OrdinalIgnoreCase)
-            .OrderByDescending(File.GetLastWriteTimeUtc)
+            .OrderBy(CaptureFileOperations.GetCaptureTimeUtc)
+            .ThenBy(Path.GetFileName, StringComparer.OrdinalIgnoreCase)
             .ToList();
+
+    private void RefreshCaptureFiles(string? selectedPath)
+    {
+        foreach (List<string> files in _sectionFiles.Values)
+            files.Clear();
+        _files.Clear();
+        _files.AddRange(GetCaptureFiles());
+        foreach (string file in _files)
+            _sectionFiles[GetSection(file)].Add(file);
+
+        foreach (CaptureSection section in _sectionFiles.Keys)
+        {
+            ListBox list = _captureLists[section];
+            list.BeginUpdate();
+            list.Items.Clear();
+            foreach (string file in _sectionFiles[section])
+                list.Items.Add(file);
+            list.EndUpdate();
+        }
+
+        UpdateCaptureList();
+        if (selectedPath is not null && File.Exists(selectedPath))
+        {
+            CaptureSection section = GetSection(selectedPath);
+            SelectSection(section);
+            _captures.SelectedIndex = _sectionFiles[section].FindIndex(
+                file => string.Equals(file, selectedPath, StringComparison.OrdinalIgnoreCase));
+        }
+        else
+        {
+            CaptureSection initialSection = _sectionFiles[CaptureSection.Todo].Count > 0
+                ? CaptureSection.Todo
+                : _sectionFiles[CaptureSection.SavedEditing].Count > 0
+                    ? CaptureSection.SavedEditing
+                    : CaptureSection.DoneData;
+            SelectSection(initialSection);
+            if (_captures.Items.Count > 0)
+                _captures.SelectedIndex = 0;
+        }
+        UpdateActionButtons();
+    }
+
+    private CaptureSection GetSection(string imagePath)
+    {
+        if (IsDataCrop(imagePath))
+            return CaptureSection.DoneData;
+        if (CaptureFileOperations.IsCompleted(imagePath, _doneDirectory))
+            return CaptureSection.DoneData;
+        return HasSavedPins(imagePath) ? CaptureSection.SavedEditing : CaptureSection.Todo;
+    }
+
+    private bool IsDataCrop(string imagePath) =>
+        string.Equals(
+            Path.GetFullPath(Path.GetDirectoryName(imagePath) ?? string.Empty),
+            Path.GetFullPath(_dataDirectory),
+            StringComparison.OrdinalIgnoreCase);
+
+    private static bool HasSavedPins(string imagePath)
+    {
+        string statePath = Path.ChangeExtension(imagePath, ".json");
+        if (!File.Exists(statePath)) return false;
+        try
+        {
+            GalleryCapture? capture = JsonSerializer.Deserialize<GalleryCapture>(
+                File.ReadAllText(statePath),
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+            return capture?.Pins is { Count: > 0 };
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or InvalidDataException)
+        {
+            Log.Error($"reading capture library state failed: {statePath}", ex);
+            return true;
+        }
+    }
+
+    private string? GetSelectedFile()
+    {
+        int index = _captures?.SelectedIndex ?? -1;
+        return index >= 0 && index < _sectionFiles[_activeSection].Count
+            ? _sectionFiles[_activeSection][index]
+            : null;
+    }
 
     private void MarkSelectedDone()
     {
-        int selectedIndex = _captures.SelectedIndex;
-        if (selectedIndex < 0 || selectedIndex >= _files.Count)
-            return;
-
-        string imagePath = _files[selectedIndex];
-        if (CaptureFileOperations.IsCompleted(imagePath, _doneDirectory))
+        string? imagePath = GetSelectedFile();
+        if (imagePath is null || CaptureFileOperations.IsCompleted(imagePath, _doneDirectory))
             return;
 
         try
@@ -208,7 +394,7 @@ internal sealed class GalleryDialog : Form
             string completedPath = CaptureFileOperations.MoveToDone(imagePath, _doneDirectory);
             RefreshCaptureFiles(completedPath);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException or System.Text.Json.JsonException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException or JsonException)
         {
             Log.Error($"marking capture done failed: {imagePath}", ex);
             MessageBox.Show(this, $"Could not move the capture to dataset\\done.\n{ex.Message}",
@@ -216,28 +402,11 @@ internal sealed class GalleryDialog : Form
         }
     }
 
-    private void RefreshCaptureFiles(string? selectedPath)
-    {
-        _files.Clear();
-        _files.AddRange(GetCaptureFiles());
-        _captures.BeginUpdate();
-        _captures.Items.Clear();
-        foreach (string file in _files)
-            _captures.Items.Add(file);
-        _captures.SelectedIndex = selectedPath is null
-            ? -1
-            : _files.FindIndex(file => string.Equals(file, selectedPath, StringComparison.OrdinalIgnoreCase));
-        _captures.EndUpdate();
-        UpdateCaptureList();
-    }
-
     private void DeleteSelectedCapture()
     {
-        int selectedIndex = _captures.SelectedIndex;
-        if (selectedIndex < 0 || selectedIndex >= _files.Count)
-            return;
+        string? imagePath = GetSelectedFile();
+        if (imagePath is null || IsDataCrop(imagePath)) return;
 
-        string imagePath = _files[selectedIndex];
         string metadataPath = Path.ChangeExtension(imagePath, ".json");
         string message = $"Permanently delete {Path.GetFileName(imagePath)} and its saved pin data?\n\n"
             + "Exported crops and labels.csv entries will not be deleted.";
@@ -269,12 +438,7 @@ internal sealed class GalleryDialog : Form
             metadataWarning = $"The capture image was deleted, but its pin data could not be deleted:\n{ex.Message}";
         }
 
-        _files.RemoveAt(selectedIndex);
-        _captures.Items.RemoveAt(selectedIndex);
-        if (_captures.Items.Count > 0)
-            _captures.SelectedIndex = Math.Min(selectedIndex, _captures.Items.Count - 1);
-        UpdateCaptureList();
-
+        RefreshCaptureFiles(null);
         if (metadataWarning is not null)
             MessageBox.Show(this, metadataWarning, "Capture partially deleted",
                 MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -283,25 +447,27 @@ internal sealed class GalleryDialog : Form
     private void DrawCapture(object? sender, DrawItemEventArgs e)
     {
         e.DrawBackground();
-        if (e.Index < 0 || e.Index >= _files.Count) return;
+        if (sender is not ListBox list || e.Index < 0 || e.Index >= list.Items.Count)
+            return;
 
         bool selected = (e.State & DrawItemState.Selected) != 0;
         var bounds = e.Bounds;
-        Color background = selected ? Theme.AccentSoft : Theme.BgDeep;
-        using (var fill = new SolidBrush(background))
+        using (var fill = new SolidBrush(selected ? Theme.PanelHi : Theme.BgDeep))
             e.Graphics.FillRectangle(fill, bounds);
 
-        string filename = Path.GetFileNameWithoutExtension(_files[e.Index]);
-        DateTime created = File.GetLastWriteTime(_files[e.Index]);
-        string source = Path.GetFileName(Path.GetDirectoryName(_files[e.Index]) ?? string.Empty);
-        string state = CaptureFileOperations.IsCompleted(_files[e.Index], _doneDirectory)
-            ? "DONE"
-            : string.Equals(source, "gallery", StringComparison.OrdinalIgnoreCase)
-                ? "OLDER GALLERY"
+        string path = (string)list.Items[e.Index]!;
+        string filename = Path.GetFileNameWithoutExtension(path);
+        DateTime created = CaptureFileOperations.GetCaptureTimeUtc(path).ToLocalTime();
+        string state = IsDataCrop(path)
+            ? "EXPORTED DATA CROP"
+            : CaptureFileOperations.IsCompleted(path, _doneDirectory)
+            ? "DONE / DATA"
+            : GetSection(path) == CaptureSection.SavedEditing
+                ? "SAVED / EDITING"
                 : "TODO";
         string details = $"{state}   ·   {created:g}";
-        using var titleFont = new Font("Segoe UI Semibold", 9.5f, FontStyle.Bold);
-        using var detailFont = new Font("Segoe UI", 8f);
+        using var titleFont = new Font("Segoe UI", 9f);
+        using var detailFont = new Font("Segoe UI", 8.25f);
         TextRenderer.DrawText(e.Graphics, filename, titleFont,
             new Rectangle(bounds.X + 12, bounds.Y + 4, bounds.Width - 24, 18),
             selected ? Color.White : Theme.Text, TextFormatFlags.EndEllipsis);
@@ -310,7 +476,7 @@ internal sealed class GalleryDialog : Form
             Theme.Muted, TextFormatFlags.EndEllipsis);
         if (selected)
         {
-            using var marker = new SolidBrush(Theme.Accent);
+            using var marker = new SolidBrush(Theme.Muted);
             e.Graphics.FillRectangle(marker, bounds.X, bounds.Y + 5, 3, bounds.Height - 10);
         }
         e.DrawFocusRectangle();

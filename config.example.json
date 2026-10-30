@@ -1,0 +1,48 @@
+{
+  "captureKey": "Alt+Q",
+  "discardKey": "M",
+  "precisionKey": "LeftShift",
+  "precisionFactor": 0.25,
+  "zones": [
+    {
+      "name": "head",
+      "key": "1"
+    },
+    {
+      "name": "chest",
+      "key": "2"
+    },
+    {
+      "name": "body",
+      "key": "3"
+    },
+    {
+      "name": "arms",
+      "key": "4"
+    },
+    {
+      "name": "legs",
+      "key": "5"
+    },
+    {
+      "name": "none",
+      "key": "6"
+    }
+  ],
+  "alwaysOnTop": false,
+  "hideWhileCapturing": false,
+  "doneRetentionDays": 7,
+  "targetCounts": {
+    "head": 500,
+    "chest": 500,
+    "body": 500,
+    "arms": 500,
+    "legs": 500,
+    "none": 500
+  },
+  "minPinSpacing": 40,
+  "windowX": null,
+  "windowY": null,
+  "windowWidth": null,
+  "windowHeight": null
+}

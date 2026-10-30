@@ -15,6 +15,8 @@ internal static class Log
 
     public static string FilePath { get; } = Path.Combine(Directory, "capture.log");
 
+    public static void Info(string message) => Write("INFO", message, null);
+
     public static void Error(string message, Exception? ex = null) => Write("ERR ", message, ex);
 
     public static void Fatal(Exception? ex) => Write("FATAL", "unhandled exception", ex);
