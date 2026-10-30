@@ -1,15 +1,22 @@
 using System.Text.Json;
+using System.Runtime.InteropServices;
 
 namespace ZoneLab;
 
 internal sealed class AppConfig
 {
-    public string CaptureKey { get; set; } = "Q";
+    public string CaptureKey { get; set; } = "Alt+Q";
     public string DiscardKey { get; set; } = "M";
     public List<ZoneConfig> Zones { get; set; } = CreateDefaultZones();
-    public int CropSize { get; set; } = 96;
     public bool AlwaysOnTop { get; set; }
     public bool HideWhileCapturing { get; set; }
+    public int DoneRetentionDays { get; set; } = 7;
+    public Dictionary<string, int> TargetCounts { get; set; } = CreateDefaultTargetCounts();
+    public int MinPinSpacing { get; set; } = 40;
+    public int? WindowX { get; set; }
+    public int? WindowY { get; set; }
+    public int? WindowWidth { get; set; }
+    public int? WindowHeight { get; set; }
 
     public static AppConfig CreateDefault() => new();
 
@@ -18,9 +25,15 @@ internal sealed class AppConfig
         CaptureKey = CaptureKey,
         DiscardKey = DiscardKey,
         Zones = Zones.Select(zone => new ZoneConfig { Name = zone.Name, Key = zone.Key }).ToList(),
-        CropSize = CropSize,
         AlwaysOnTop = AlwaysOnTop,
         HideWhileCapturing = HideWhileCapturing,
+        DoneRetentionDays = DoneRetentionDays,
+        TargetCounts = new Dictionary<string, int>(TargetCounts, StringComparer.OrdinalIgnoreCase),
+        MinPinSpacing = MinPinSpacing,
+        WindowX = WindowX,
+        WindowY = WindowY,
+        WindowWidth = WindowWidth,
+        WindowHeight = WindowHeight,
     };
 
     public static AppConfig Load(string path)
@@ -32,6 +45,9 @@ internal sealed class AppConfig
         var config = JsonSerializer.Deserialize<AppConfig>(File.ReadAllText(path), options)
             ?? throw new InvalidDataException("config.json is empty or invalid.");
 
+        if (config.TargetCounts is not null)
+            config.TargetCounts = new Dictionary<string, int>(config.TargetCounts, StringComparer.OrdinalIgnoreCase);
+        MigratePreviousDefaults(config);
         Validate(config);
         return config;
     }
@@ -40,8 +56,16 @@ internal sealed class AppConfig
     {
         if (config.Zones is null || config.Zones.Count is < 1 or > 20)
             throw new InvalidDataException("Configure between 1 and 20 zones.");
-        if (config.CropSize is < 48 or > 192)
-            throw new InvalidDataException("Crop size must be between 48 and 192 pixels.");
+        if (config.DoneRetentionDays is < 0 or > 3650)
+            throw new InvalidDataException("Done retention must be between 0 and 3650 days.");
+        if (config.MinPinSpacing is < 0 or > 10000)
+            throw new InvalidDataException("Minimum pin spacing must be between 0 and 10000 pixels.");
+        if (config.WindowWidth is < 1 or > 10000 || config.WindowHeight is < 1 or > 10000)
+            throw new InvalidDataException("Saved window dimensions must be between 1 and 10000 pixels.");
+        if (config.WindowX is < -100000 or > 100000 || config.WindowY is < -100000 or > 100000)
+            throw new InvalidDataException("Saved window position is outside the supported coordinate range.");
+        if (config.TargetCounts is null)
+            throw new InvalidDataException("Target counts cannot be null.");
 
         var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var zone in config.Zones)
@@ -57,27 +81,49 @@ internal sealed class AppConfig
                 throw new InvalidDataException($"The zone '{zone.Name}' is listed more than once.");
         }
 
-        var keys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (ZoneConfig zone in config.Zones)
+        {
+            if (!config.TargetCounts.ContainsKey(zone.Name))
+                config.TargetCounts[zone.Name] = 500;
+        }
+
+        foreach ((string name, int count) in config.TargetCounts)
+        {
+            if (string.IsNullOrWhiteSpace(name) || count < 0)
+                throw new InvalidDataException("Target count names must be non-empty and counts cannot be negative.");
+        }
+
+        config.CaptureKey = NormalizeCaptureKey(config.CaptureKey);
+        HotkeyBinding captureKey = ParseHotkey(config.CaptureKey);
+        if (captureKey.Key != Keys.None && !IsSupportedCaptureKey(captureKey.Key))
+            throw new InvalidDataException("The capture key must be a letter or digit.");
+        var keys = new HashSet<HotkeyBinding>();
         foreach (string value in new[] { config.CaptureKey, config.DiscardKey }.Concat(config.Zones.Select(zone => zone.Key)))
         {
             string key = value?.Trim() ?? string.Empty;
             if (key.Length == 0) continue;
-            Keys parsed = ParseConfiguredKey(key);
-            if (!keys.Add(parsed.ToString()))
-                throw new InvalidDataException($"The shortcut '{FormatKey(parsed)}' is assigned more than once.");
+            HotkeyBinding parsed = ParseHotkey(key);
+            if (parsed == new HotkeyBinding(Keys.Z, HotkeyModifiers.Control))
+                throw new InvalidDataException("Ctrl+Z is reserved for undo.");
+            if (!keys.Add(parsed))
+                throw new InvalidDataException($"The shortcut '{FormatHotkey(parsed)}' is assigned more than once.");
         }
 
-        config.CaptureKey = NormalizeKey(config.CaptureKey);
         config.DiscardKey = NormalizeKey(config.DiscardKey);
         foreach (var zone in config.Zones)
             zone.Key = NormalizeKey(zone.Key);
     }
 
-    public static bool IsSupportedKey(Keys key) =>
-        key is >= Keys.D0 and <= Keys.D9
-        or >= Keys.NumPad0 and <= Keys.NumPad9
-        or >= Keys.A and <= Keys.Z
-        or >= Keys.F1 and <= Keys.F12;
+    public static bool IsSupportedKey(Keys key)
+    {
+        key &= Keys.KeyCode;
+        return key != Keys.None
+            && Enum.IsDefined(key)
+            && key is not Keys.ShiftKey and not Keys.LShiftKey and not Keys.RShiftKey
+                and not Keys.ControlKey and not Keys.LControlKey and not Keys.RControlKey
+                and not Keys.Menu and not Keys.LMenu and not Keys.RMenu
+                and not Keys.LWin and not Keys.RWin;
+    }
 
     public static string FormatKey(Keys key) => key switch
     {
@@ -90,13 +136,45 @@ internal sealed class AppConfig
     public static string NormalizeKey(string? value)
     {
         if (string.IsNullOrWhiteSpace(value)) return string.Empty;
-        return ToConfigKey(ParseConfiguredKey(value));
+        return ToConfigKey(ParseHotkey(value));
     }
 
-    public static Keys ParseKey(string? value) =>
-        string.IsNullOrWhiteSpace(value) ? Keys.None : ParseConfiguredKey(value);
+    public static string NormalizeCaptureKey(string? value)
+    {
+        return NormalizeKey(value);
+    }
 
-    public static string ToConfigKey(Keys key)
+    public static bool IsSupportedCaptureKey(Keys key)
+    {
+        key &= Keys.KeyCode;
+        return key is >= Keys.A and <= Keys.Z
+            or >= Keys.D0 and <= Keys.D9;
+    }
+
+    public static HotkeyBinding ParseHotkey(string? value) =>
+        string.IsNullOrWhiteSpace(value) ? new HotkeyBinding(Keys.None, HotkeyModifiers.None) : ParseConfiguredHotkey(value);
+
+    public static string ToConfigKey(HotkeyBinding binding)
+    {
+        if (binding.Key == Keys.None)
+            return string.Empty;
+        var parts = new List<string>();
+        if (binding.Modifiers.HasFlag(HotkeyModifiers.Control)) parts.Add("Ctrl");
+        if (binding.Modifiers.HasFlag(HotkeyModifiers.Alt)) parts.Add("Alt");
+        if (binding.Modifiers.HasFlag(HotkeyModifiers.Shift)) parts.Add("Shift");
+        if (binding.Modifiers.HasFlag(HotkeyModifiers.Windows)) parts.Add("Win");
+        parts.Add(KeyToConfigKey(binding.Key));
+        return string.Join("+", parts);
+    }
+
+    public static string FormatHotkey(HotkeyBinding binding)
+    {
+        if (binding.Key == Keys.None)
+            return "None";
+        return ToConfigKey(binding).Replace("NumPad", "Num ", StringComparison.Ordinal);
+    }
+
+    private static string KeyToConfigKey(Keys key)
     {
         if (key is >= Keys.D0 and <= Keys.D9)
             return ((int)key - (int)Keys.D0).ToString();
@@ -105,20 +183,65 @@ internal sealed class AppConfig
         return key == Keys.None ? string.Empty : key.ToString();
     }
 
-    private static Keys ParseConfiguredKey(string value)
+    private static HotkeyBinding ParseConfiguredHotkey(string value)
     {
-        string keyText = value.Trim();
+        HotkeyModifiers modifiers = HotkeyModifiers.None;
+        string? keyText = null;
+        foreach (string rawPart in value.Split('+'))
+        {
+            string part = rawPart.Trim();
+            if (part.Length == 0)
+                throw new InvalidDataException($"'{value}' is not a supported shortcut.");
+            switch (part.ToLowerInvariant())
+            {
+                case "ctrl":
+                case "control":
+                    modifiers |= HotkeyModifiers.Control;
+                    break;
+                case "alt":
+                    modifiers |= HotkeyModifiers.Alt;
+                    break;
+                case "shift":
+                    modifiers |= HotkeyModifiers.Shift;
+                    break;
+                case "win":
+                case "windows":
+                    modifiers |= HotkeyModifiers.Windows;
+                    break;
+                default:
+                    if (keyText is not null || !TryParseKey(part, out Keys parsedKey))
+                        throw new InvalidDataException($"'{value}' is not a supported shortcut.");
+                    keyText = part;
+                    break;
+            }
+        }
+
+        if (keyText is null || !TryParseKey(keyText, out Keys key) || !IsSupportedKey(key))
+            throw new InvalidDataException($"'{value}' is not a supported shortcut key.");
+        return new HotkeyBinding(key, modifiers);
+    }
+
+    private static bool TryParseKey(string keyText, out Keys key)
+    {
+        key = Keys.None;
         if (keyText.Length == 1 && char.IsDigit(keyText[0]))
-            return (Keys)((int)Keys.D0 + (keyText[0] - '0'));
+        {
+            key = (Keys)((int)Keys.D0 + (keyText[0] - '0'));
+            return true;
+        }
         if (keyText.StartsWith("Num ", StringComparison.OrdinalIgnoreCase)
             && keyText.Length == 5 && char.IsDigit(keyText[4]))
-            return (Keys)((int)Keys.NumPad0 + (keyText[4] - '0'));
+        {
+            key = (Keys)((int)Keys.NumPad0 + (keyText[4] - '0'));
+            return true;
+        }
         if (keyText.StartsWith("NumPad", StringComparison.OrdinalIgnoreCase)
             && keyText.Length == 7 && char.IsDigit(keyText[6]))
-            return (Keys)((int)Keys.NumPad0 + (keyText[6] - '0'));
-        if (Enum.TryParse(keyText, ignoreCase: true, out Keys key) && IsSupportedKey(key))
-            return key;
-        throw new InvalidDataException($"'{value}' is not a supported shortcut key.");
+        {
+            key = (Keys)((int)Keys.NumPad0 + (keyText[6] - '0'));
+            return true;
+        }
+        return Enum.TryParse(keyText, ignoreCase: true, out key) && IsSupportedKey(key);
     }
 
     private static List<ZoneConfig> CreateDefaultZones() =>
@@ -126,13 +249,92 @@ internal sealed class AppConfig
         new() { Name = "head", Key = "1" },
         new() { Name = "chest", Key = "2" },
         new() { Name = "body", Key = "3" },
-        new() { Name = "legs", Key = "4" },
-        new() { Name = "none", Key = "5" },
+        new() { Name = "arms", Key = "4" },
+        new() { Name = "legs", Key = "5" },
+        new() { Name = "none", Key = "6" },
     ];
+
+    private static Dictionary<string, int> CreateDefaultTargetCounts() =>
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["head"] = 500,
+            ["chest"] = 500,
+            ["body"] = 500,
+            ["arms"] = 500,
+            ["legs"] = 500,
+            ["none"] = 500,
+        };
+
+    private static void MigratePreviousDefaults(AppConfig config)
+    {
+        HotkeyBinding previousCapture = ParseHotkey(config.CaptureKey);
+        if (previousCapture.Key != Keys.None && !IsSupportedCaptureKey(previousCapture.Key))
+            config.CaptureKey = "Alt+Q";
+
+        var oldZones = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["head"] = "1",
+            ["chest"] = "2",
+            ["body"] = "3",
+            ["legs"] = "4",
+            ["none"] = "5",
+        };
+        if (config.Zones is not null
+            && config.Zones.Count == oldZones.Count
+            && config.Zones.All(zone => zone is not null
+                && !string.IsNullOrEmpty(zone.Name)
+                && oldZones.TryGetValue(zone.Name, out string? key)
+                && string.Equals(zone.Key, key, StringComparison.OrdinalIgnoreCase)))
+            config.Zones = CreateDefaultZones();
+
+        var oldTargets = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["head"] = 500,
+            ["chest"] = 300,
+            ["body"] = 300,
+            ["legs"] = 300,
+            ["none"] = 500,
+        };
+        if (config.TargetCounts is not null
+            && config.TargetCounts.Count == oldTargets.Count
+            && oldTargets.All(pair => config.TargetCounts.TryGetValue(pair.Key, out int value)
+                && value == pair.Value))
+            config.TargetCounts = CreateDefaultTargetCounts();
+    }
 }
 
 internal sealed class ZoneConfig
 {
     public string Name { get; set; } = string.Empty;
     public string Key { get; set; } = string.Empty;
+}
+
+[Flags]
+internal enum HotkeyModifiers
+{
+    None = 0,
+    Control = 1,
+    Alt = 2,
+    Shift = 4,
+    Windows = 8,
+}
+
+internal readonly record struct HotkeyBinding(Keys Key, HotkeyModifiers Modifiers)
+{
+    [DllImport("user32.dll")]
+    private static extern short GetKeyState(int virtualKey);
+
+    public static HotkeyModifiers ReadModifiers(Keys modifiers)
+    {
+        HotkeyModifiers result = HotkeyModifiers.None;
+        if ((modifiers & Keys.Control) != 0) result |= HotkeyModifiers.Control;
+        if ((modifiers & Keys.Alt) != 0) result |= HotkeyModifiers.Alt;
+        if ((modifiers & Keys.Shift) != 0) result |= HotkeyModifiers.Shift;
+        if ((GetKeyState(0x5B) & 0x8000) != 0 || (GetKeyState(0x5C) & 0x8000) != 0)
+            result |= HotkeyModifiers.Windows;
+        return result;
+    }
+
+    public bool Matches(Keys key, Keys modifiers) =>
+        Key == key && Modifiers == ReadModifiers(modifiers);
 }

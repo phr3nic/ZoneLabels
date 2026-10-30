@@ -4,6 +4,45 @@ namespace ZoneLab;
 
 internal static class CaptureFileOperations
 {
+    public static int? PurgeDone(string doneDirectory, int retentionDays)
+    {
+        if (!Directory.Exists(doneDirectory))
+            return null;
+
+        DateTime cutoff = DateTime.UtcNow.AddDays(-retentionDays);
+        string[] files = Directory.GetFiles(doneDirectory, "*", SearchOption.TopDirectoryOnly);
+        int removed = 0;
+        foreach (string file in files)
+        {
+            if (string.Equals(Path.GetExtension(file), ".json", StringComparison.OrdinalIgnoreCase)
+                || !File.Exists(file)
+                || File.GetLastWriteTimeUtc(file) >= cutoff)
+                continue;
+
+            File.Delete(file);
+            removed++;
+            string sidecar = Path.ChangeExtension(file, ".json");
+            if (File.Exists(sidecar))
+            {
+                File.Delete(sidecar);
+                removed++;
+            }
+        }
+
+        foreach (string file in files)
+        {
+            if (!string.Equals(Path.GetExtension(file), ".json", StringComparison.OrdinalIgnoreCase)
+                || !File.Exists(file)
+                || File.GetLastWriteTimeUtc(file) >= cutoff)
+                continue;
+
+            File.Delete(file);
+            removed++;
+        }
+
+        return removed;
+    }
+
     public static bool IsCompleted(string imagePath, string doneDirectory) =>
         string.Equals(
             Path.GetFullPath(Path.GetDirectoryName(imagePath) ?? string.Empty),
