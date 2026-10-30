@@ -1,0 +1,8 @@
+bin/
+obj/
+portable*/
+dataset/
+config.json
+*.user
+*.suo
+.vs/
